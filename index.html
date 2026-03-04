@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zito Call Analytics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&family=Barlow:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- TOPBAR -->
+  <div id="topbar">
+    <div class="logo">
+      <div class="logo-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.5">
+          <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 013.07 11.5 19.79 19.79 0 010 2.88 2 2 0 012 .7h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L6.09 8.54a16 16 0 006.72 6.72l1.21-1.21a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/>
+        </svg>
+      </div>
+      <div>
+        <div class="logo-text">Zito Analytics</div>
+        <div class="logo-sub">QA Command</div>
+      </div>
+    </div>
+
+    <div class="topbar-divider"></div>
+
+    <div class="bucket-pills">
+      <div class="bucket-pill" id="pill-zito">
+        <div class="bp-dot"></div>
+        <div class="bp-info">
+          <div class="bp-label">Sales</div>
+          <div class="bp-name">zito-json-summaries</div>
+        </div>
+        <div class="bp-count" id="pcount-zito">—</div>
+      </div>
+      <div class="bucket-pill" id="pill-csr">
+        <div class="bp-dot"></div>
+        <div class="bp-info">
+          <div class="bp-label">CSR</div>
+          <div class="bp-name">csr-json-summaries</div>
+        </div>
+        <div class="bp-count" id="pcount-csr">—</div>
+      </div>
+      <button class="btn-load" onclick="loadAll()">↺ Load Calls</button>
+    </div>
+
+    <div class="topbar-right">
+      <div class="results-pill" id="resultsLabel">No data loaded</div>
+      <div class="view-btns">
+        <button class="vbtn active" id="vbtn-grid" onclick="setView('grid')" title="Grid">
+          <svg viewBox="0 0 14 14" fill="currentColor"><rect x="0" y="0" width="6" height="6" rx="1"/><rect x="8" y="0" width="6" height="6" rx="1"/><rect x="0" y="8" width="6" height="6" rx="1"/><rect x="8" y="8" width="6" height="6" rx="1"/></svg>
+        </button>
+        <button class="vbtn" id="vbtn-list" onclick="setView('list')" title="List">
+          <svg viewBox="0 0 14 14" fill="currentColor"><rect x="0" y="1" width="14" height="2" rx="1"/><rect x="0" y="6" width="14" height="2" rx="1"/><rect x="0" y="11" width="14" height="2" rx="1"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- APP BODY -->
+  <div id="app">
+
+    <!-- SIDEBAR -->
+    <div id="sidebar">
+
+      <div class="sidebar-section">
+        <div class="sidebar-title">Team</div>
+        <div class="team-btns">
+          <button class="team-btn active-all" id="tbtn-all" onclick="setTeam('all')">
+            <span class="tb-dot"></span> All Teams
+            <span class="tb-count" id="tc-all">—</span>
+          </button>
+          <button class="team-btn" id="tbtn-zito" onclick="setTeam('zito')">
+            <span class="tb-dot"></span> Sales (Zito)
+            <span class="tb-count" id="tc-zito">—</span>
+          </button>
+          <button class="team-btn" id="tbtn-csr" onclick="setTeam('csr')">
+            <span class="tb-dot"></span> CSR
+            <span class="tb-count" id="tc-csr">—</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-title">Filters</div>
+        <div class="filter-row">
+          <label class="filter-label">Search Agent</label>
+          <input type="text" class="filter-input" id="searchAgent" placeholder="Agent name..." oninput="applyFilters()" />
+        </div>
+        <div class="filter-row">
+          <label class="filter-label">From Date</label>
+          <input type="date" class="filter-input" id="dateFrom" onchange="applyFilters()" />
+        </div>
+        <div class="filter-row">
+          <label class="filter-label">To Date</label>
+          <input type="date" class="filter-input" id="dateTo" onchange="applyFilters()" />
+        </div>
+        <div class="filter-row">
+          <label class="filter-label">Outcome</label>
+          <select class="filter-select" id="filterOutcome" onchange="applyFilters()">
+            <option value="">All Outcomes</option>
+            <option value="sale">Sale</option>
+            <option value="retain">Retained</option>
+            <option value="support">Support / Dispatch</option>
+            <option value="lost">Lost / Canceled</option>
+          </select>
+        </div>
+        <div class="filter-row">
+          <label class="filter-label">Call Type</label>
+          <select class="filter-select" id="filterCallType" onchange="applyFilters()">
+            <option value="">All Types</option>
+            <option value="inbound">Inbound</option>
+            <option value="outbound">Outbound</option>
+          </select>
+        </div>
+        <button class="btn-clear-filters" onclick="clearFilters()">✕ Clear Filters</button>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-title">Summary</div>
+        <div class="stat-rows">
+          <div class="stat-row"><span class="stat-row-label sc">Total</span><span class="stat-card-val sc" id="ss-total">—</span></div>
+          <div class="stat-row"><span class="stat-row-label sg">Sales</span><span class="stat-card-val sg" id="ss-sales">—</span></div>
+          <div class="stat-row"><span class="stat-row-label sb">Retained</span><span class="stat-card-val sb" id="ss-retained">—</span></div>
+          <div class="stat-row"><span class="stat-row-label sp">Support</span><span class="stat-card-val sp" id="ss-support">—</span></div>
+          <div class="stat-row"><span class="stat-row-label sr">Lost</span><span class="stat-card-val sr" id="ss-lost">—</span></div>
+          <div class="stat-row"><span class="stat-row-label sa">Avg QA</span><span class="stat-card-val sa" id="ss-qa">—</span></div>
+        </div>
+      </div>
+
+      <div class="sidebar-section" id="areaSection" style="display:none">
+        <div class="sidebar-title">Service Areas <span class="area-hint">(click to analyze)</span></div>
+        <div class="area-list" id="areaList"></div>
+      </div>
+
+    </div>
+
+    <!-- MAIN CONTENT -->
+    <div id="main">
+      <div class="stats-bar">
+        <div class="stat-card sc"><div class="stat-card-label">Total Calls</div><div class="stat-card-val" id="stat-total">—</div></div>
+        <div class="stat-card sg"><div class="stat-card-label">Sales</div><div class="stat-card-val" id="stat-sales">—</div></div>
+        <div class="stat-card sb"><div class="stat-card-label">Retained</div><div class="stat-card-val" id="stat-retained">—</div></div>
+        <div class="stat-card sp"><div class="stat-card-label">Support</div><div class="stat-card-val" id="stat-support">—</div></div>
+        <div class="stat-card sa"><div class="stat-card-label">Avg QA</div><div class="stat-card-val" id="stat-qa">—</div></div>
+        <div class="stat-card sr"><div class="stat-card-label">Lost/Canceled</div><div class="stat-card-val" id="stat-lost">—</div></div>
+      </div>
+      <div id="callGrid">
+        <div class="state-box">
+          <span class="icon">📡</span>
+          <p><strong>Click "Load Calls"</strong> in the top bar<br>to fetch records from both buckets.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- AI ANALYSIS PANEL -->
+    <div id="aiPanel">
+      <div class="ai-header">
+        <div class="ai-title">
+          <div class="ai-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2">
+              <path d="M12 2a10 10 0 110 20A10 10 0 0112 2z"/>
+              <path d="M12 8v4l3 3"/>
+            </svg>
+          </div>
+          <div>
+            <div class="ai-title-text">AI Analysis</div>
+            <div class="ai-area-badge" id="aiAreaBadge">—</div>
+          </div>
+        </div>
+        <button class="btn-close-ai" onclick="closeAiPanel()">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M1 1l12 12M13 1L1 13"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="ai-body" id="aiBody">
+        <div class="ai-placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M12 6v6l4 2"/>
+          </svg>
+          <p>Select a <strong>Service Area</strong><br>from the sidebar to<br>generate AI next steps.</p>
+        </div>
+      </div>
+
+      <div class="ai-footer">
+        <button class="btn-analyze" id="btnAnalyze" onclick="runAnalysis()" disabled>
+          ✦ Generate AI Analysis
+        </button>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
