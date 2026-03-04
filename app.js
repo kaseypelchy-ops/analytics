@@ -1,6 +1,8 @@
 // ── Config ────────────────────────────────────────────────────
 const GCS_KEY = 'AIzaSyAdsm31FX6Mp5x5IoHDWn1UkUpVUqRBEdk';
-const AI_KEY  = '';
+const AI_KEY  = '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';
+const CACHE_KEY  = 'zito_calls_cache';
+const CACHE_META = 'zito_calls_meta';
 
 // ── State ─────────────────────────────────────────────────────
 let allCalls    = [];
@@ -73,70 +75,87 @@ function normalize(raw, source) {
   }
 }
 
+// ── Cache helpers ─────────────────────────────────────────────
+function saveCache(source, calls) {
+  try {
+    const meta = JSON.parse(localStorage.getItem(CACHE_META) || '{}');
+    meta[source] = { lastLoaded: new Date().toISOString(), count: calls.length };
+    localStorage.setItem(CACHE_META, JSON.stringify(meta));
+
+    const existing = JSON.parse(localStorage.getItem(CACHE_KEY) || '[]');
+    const others   = existing.filter(c => c._source !== source);
+    // Store dates as ISO strings so they survive JSON serialization
+    const serialized = calls.map(c => ({ ...c, _date: c._date ? c._date.toISOString() : null }));
+    localStorage.setItem(CACHE_KEY, JSON.stringify([...others, ...serialized]));
+  } catch(e) {
+    console.warn('Cache save failed (storage full?):', e);
+  }
+}
+
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw).map(c => ({ ...c, _date: c._date ? new Date(c._date) : null }));
+  } catch(e) { return []; }
+}
+
+function getCacheMeta(source) {
+  try {
+    const meta = JSON.parse(localStorage.getItem(CACHE_META) || '{}');
+    return meta[source] || null;
+  } catch(e) { return null; }
+}
+
+function clearCache() {
+  localStorage.removeItem(CACHE_KEY);
+  localStorage.removeItem(CACHE_META);
+}
+
 // ── Bucket Loader ─────────────────────────────────────────────
-async function loadAll() {
+async function loadAll(forceRefresh = false) {
+  // On first run, try loading from cache instantly
+  if (!forceRefresh) {
+    const cached = loadCache();
+    if (cached.length > 0) {
+      allCalls = cached;
+      allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
+      updateTeamCounts();
+      applyFilters();
+      // Then quietly check for new files in the background
+      ['zito-json-summaries', 'zito', 'csr-json-summaries', 'csr'].forEach((_, i, arr) => {
+        if (i % 2 === 0) loadBucket(arr[i], arr[i+1], false);
+      });
+      return;
+    }
+  } else {
+    clearCache();
+  }
   await Promise.all([
-    loadBucket('zito-json-summaries', 'zito'),
-    loadBucket('csr-json-summaries',  'csr'),
+    loadBucket('zito-json-summaries', 'zito', true),
+    loadBucket('csr-json-summaries',  'csr',  true),
   ]);
 }
 
-async function listAllFiles(bucket) {
-  const files = [];
-  let pageToken = null;
-  do {
-    const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o?maxResults=1000&key=${GCS_KEY}`
-      + (pageToken ? `&pageToken=${pageToken}` : '');
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    (data.items || []).filter(f => f.name.endsWith('.json')).forEach(f => files.push(f));
-    pageToken = data.nextPageToken || null;
-  } while (pageToken);
-  return files;
-}
-
-async function fetchWithRetry(url, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) return res;
-    } catch(e) {
-      if (i === retries - 1) throw e;
-      await new Promise(r => setTimeout(r, 500 * (i + 1)));
-    }
-  }
-  return null;
-}
-
 async function loadBucket(bucket, key) {
-  setPillState(key, 'loading', 'Listing files...');
+  setPillState(key, 'loading', 'Loading...');
   try {
-    const files = await listAllFiles(bucket);
+    const res = await fetch(`https://storage.googleapis.com/storage/v1/b/${bucket}/o?maxResults=1000&key=${GCS_KEY}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data  = await res.json();
+    const files = (data.items || []).filter(f => f.name.endsWith('.json'));
     if (!files.length) throw new Error('No JSON files found');
 
-    setPillState(key, 'loading', `0 / ${files.length}`);
     allCalls = allCalls.filter(c => c._source !== key);
-
     let loaded = 0;
-    const BATCH = 20;
-    for (let i = 0; i < files.length; i += BATCH) {
-      const batch = files.slice(i, i + BATCH);
-      await Promise.all(batch.map(async file => {
-        const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(file.name)}?alt=media&key=${GCS_KEY}`;
-        const fr = await fetchWithRetry(url);
-        if (fr) {
-          try {
-            allCalls.push(normalize(await fr.json(), key));
-            loaded++;
-          } catch(e) { /* skip malformed JSON */ }
-        }
-      }));
-      setPillState(key, 'loading', `${loaded} / ${files.length}`);
+    for (const file of files) {
+      try {
+        const fr = await fetch(`https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(file.name)}?alt=media&key=${GCS_KEY}`);
+        if (fr.ok) { allCalls.push(normalize(await fr.json(), key)); loaded++; }
+      } catch(e) { /* skip bad files */ }
     }
-
     allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
-    setPillState(key, 'loaded', `${loaded} / ${files.length} calls`);
+    setPillState(key, 'loaded', loaded + ' calls');
     updateTeamCounts();
     applyFilters();
   } catch(e) {

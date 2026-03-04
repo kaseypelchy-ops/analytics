@@ -96,6 +96,8 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); disp
 }
 .btn-load:hover  { background: #00b8a0; }
 .btn-load:active { transform: scale(0.97); }
+.btn-refresh { background: var(--card2); color: var(--text2); border: 1px solid var(--line2); }
+.btn-refresh:hover { background: var(--line2); color: var(--text); }
 
 .topbar-right { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-shrink: 0; }
 

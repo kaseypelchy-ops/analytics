@@ -43,7 +43,8 @@
         </div>
         <div class="bp-count" id="pcount-csr">—</div>
       </div>
-      <button class="btn-load" onclick="loadAll()">↺ Load Calls</button>
+      <button class="btn-load" onclick="loadAll(false)" title="Load new calls only">↺ Load Calls</button>
+      <button class="btn-load btn-refresh" onclick="loadAll(true)" title="Re-fetch everything from scratch">⟳ Force Refresh</button>
     </div>
 
     <div class="topbar-right">
