@@ -1,6 +1,6 @@
 // ── Config ────────────────────────────────────────────────────
 const GCS_KEY = 'AIzaSyAdsm31FX6Mp5x5IoHDWn1UkUpVUqRBEdk';
-const AI_KEY  = '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';
+const AI_KEY  = '';
 
 // ── State ─────────────────────────────────────────────────────
 let allCalls    = [];
@@ -81,25 +81,62 @@ async function loadAll() {
   ]);
 }
 
-async function loadBucket(bucket, key) {
-  setPillState(key, 'loading', 'Loading...');
-  try {
-    const res = await fetch(`https://storage.googleapis.com/storage/v1/b/${bucket}/o?maxResults=1000&key=${GCS_KEY}`);
+async function listAllFiles(bucket) {
+  const files = [];
+  let pageToken = null;
+  do {
+    const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o?maxResults=1000&key=${GCS_KEY}`
+      + (pageToken ? `&pageToken=${pageToken}` : '');
+    const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data  = await res.json();
-    const files = (data.items || []).filter(f => f.name.endsWith('.json'));
+    const data = await res.json();
+    (data.items || []).filter(f => f.name.endsWith('.json')).forEach(f => files.push(f));
+    pageToken = data.nextPageToken || null;
+  } while (pageToken);
+  return files;
+}
+
+async function fetchWithRetry(url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) return res;
+    } catch(e) {
+      if (i === retries - 1) throw e;
+      await new Promise(r => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  return null;
+}
+
+async function loadBucket(bucket, key) {
+  setPillState(key, 'loading', 'Listing files...');
+  try {
+    const files = await listAllFiles(bucket);
     if (!files.length) throw new Error('No JSON files found');
 
+    setPillState(key, 'loading', `0 / ${files.length}`);
     allCalls = allCalls.filter(c => c._source !== key);
+
     let loaded = 0;
-    for (const file of files) {
-      try {
-        const fr = await fetch(`https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(file.name)}?alt=media&key=${GCS_KEY}`);
-        if (fr.ok) { allCalls.push(normalize(await fr.json(), key)); loaded++; }
-      } catch(e) { /* skip bad files */ }
+    const BATCH = 20;
+    for (let i = 0; i < files.length; i += BATCH) {
+      const batch = files.slice(i, i + BATCH);
+      await Promise.all(batch.map(async file => {
+        const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(file.name)}?alt=media&key=${GCS_KEY}`;
+        const fr = await fetchWithRetry(url);
+        if (fr) {
+          try {
+            allCalls.push(normalize(await fr.json(), key));
+            loaded++;
+          } catch(e) { /* skip malformed JSON */ }
+        }
+      }));
+      setPillState(key, 'loading', `${loaded} / ${files.length}`);
     }
+
     allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
-    setPillState(key, 'loaded', loaded + ' calls');
+    setPillState(key, 'loaded', `${loaded} / ${files.length} calls`);
     updateTeamCounts();
     applyFilters();
   } catch(e) {
