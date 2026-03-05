@@ -439,3 +439,26 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); disp
 }
 .ai-key-input::placeholder { color: var(--text3); }
 .ai-key-input:focus         { border-color: var(--accent); }
+
+/* ── AI KEY INPUT ─────────────────────────────────────── */
+.ai-key-row        { display: flex; flex-direction: column; gap: 5px; padding: 0 0 10px; }
+.ai-key-label      { font-family: var(--mono); font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: .06em; }
+.ai-key-input      {
+  background: var(--card);
+  border: 1px solid var(--line2);
+  border-radius: 7px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  outline: none;
+  transition: border-color .15s;
+  width: 100%;
+  box-sizing: border-box;
+}
+.ai-key-input::placeholder { color: var(--text3); }
+.ai-key-input:focus         { border-color: var(--cyan); }
+
+/* ── INFINITE SCROLL SENTINEL ─────────────────────────── */
+.load-sentinel    { grid-column: 1/-1; display: flex; justify-content: center; padding: 20px 0; }
+.load-more-hint   { font-family: var(--mono); font-size: 10px; color: var(--text3); letter-spacing: 1px; }

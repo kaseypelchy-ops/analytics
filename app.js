@@ -1,14 +1,24 @@
 // ── Config ────────────────────────────────────────────────────
-const GCS_KEY = 'AIzaSyAdsm31FX6Mp5x5IoHDWn1UkUpVUqRBEdk';
-// API key is entered by the user in the AI panel — never hardcoded
+const GCS_KEY    = 'AIzaSyAdsm31FX6Mp5x5IoHDWn1UkUpVUqRBEdk';
 const CACHE_KEY  = 'zito_calls_cache';
 const CACHE_META = 'zito_calls_meta';
+const PAGE_SIZE   = 50;   // cards rendered per page
+const FETCH_BATCH = 20;   // concurrent GCS file fetches
 
 // ── State ─────────────────────────────────────────────────────
-let allCalls    = [];
-let filtered    = [];
-let activeTeam  = 'all';
+let allCalls     = [];
+let filtered     = [];
+let activeTeam   = 'all';
 let selectedArea = null;
+let renderPage   = 0;
+let filterTimer  = null;
+let scrollObserver = null;
+
+// ── Init ──────────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  const savedKey = sessionStorage.getItem('zito_api_key');
+  if (savedKey) document.getElementById('aiApiKey').value = savedKey;
+});
 
 // ── Schema Normalizer ─────────────────────────────────────────
 function normalize(raw, source) {
@@ -76,29 +86,23 @@ function normalize(raw, source) {
 }
 
 // ── Meaningfulness Check ──────────────────────────────────────
-// Returns false if the call record is essentially all N/A / empty / unknown
 function isMeaningful(c) {
-  const blank = v => !v || ['n/a', 'na', 'unknown', 'none', 'null', '—', '-', ''].includes(String(v).toLowerCase().trim());
+  const blank = v => !v || ['n/a','na','unknown','none','null','—','-',''].includes(String(v).toLowerCase().trim());
   const keyFields = [c.agentName, c.serviceArea, c.callOutcome, c.callType, c.qaScore, c.summary, c.sentiment];
-  const meaningfulCount = keyFields.filter(v => !blank(v)).length;
-  return meaningfulCount >= 2; // require at least 2 real fields
+  return keyFields.filter(v => !blank(v)).length >= 2;
 }
 
-
+// ── Cache ─────────────────────────────────────────────────────
 function saveCache(source, calls) {
   try {
     const meta = JSON.parse(localStorage.getItem(CACHE_META) || '{}');
     meta[source] = { lastLoaded: new Date().toISOString(), count: calls.length };
     localStorage.setItem(CACHE_META, JSON.stringify(meta));
-
-    const existing = JSON.parse(localStorage.getItem(CACHE_KEY) || '[]');
-    const others   = existing.filter(c => c._source !== source);
-    // Store dates as ISO strings so they survive JSON serialization
+    const existing   = JSON.parse(localStorage.getItem(CACHE_KEY) || '[]');
+    const others     = existing.filter(c => c._source !== source);
     const serialized = calls.map(c => ({ ...c, _date: c._date ? c._date.toISOString() : null }));
     localStorage.setItem(CACHE_KEY, JSON.stringify([...others, ...serialized]));
-  } catch(e) {
-    console.warn('Cache save failed (storage full?):', e);
-  }
+  } catch(e) { console.warn('Cache save failed:', e); }
 }
 
 function loadCache() {
@@ -109,13 +113,6 @@ function loadCache() {
   } catch(e) { return []; }
 }
 
-function getCacheMeta(source) {
-  try {
-    const meta = JSON.parse(localStorage.getItem(CACHE_META) || '{}');
-    return meta[source] || null;
-  } catch(e) { return null; }
-}
-
 function clearCache() {
   localStorage.removeItem(CACHE_KEY);
   localStorage.removeItem(CACHE_META);
@@ -123,7 +120,6 @@ function clearCache() {
 
 // ── Bucket Loader ─────────────────────────────────────────────
 async function loadAll(forceRefresh = false) {
-  // On first run, try loading from cache instantly
   if (!forceRefresh) {
     const cached = loadCache();
     if (cached.length > 0) {
@@ -131,69 +127,86 @@ async function loadAll(forceRefresh = false) {
       allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
       updateTeamCounts();
       applyFilters();
-      // Then quietly check for new files in the background
-      ['zito-json-summaries', 'zito', 'csr-json-summaries', 'csr'].forEach((_, i, arr) => {
-        if (i % 2 === 0) loadBucket(arr[i], arr[i+1], false);
-      });
+      loadBucket('zito-json-summaries', 'zito');
+      loadBucket('csr-json-summaries',  'csr');
       return;
     }
   } else {
     clearCache();
   }
   await Promise.all([
-    loadBucket('zito-json-summaries', 'zito', true),
-    loadBucket('csr-json-summaries',  'csr',  true),
+    loadBucket('zito-json-summaries', 'zito'),
+    loadBucket('csr-json-summaries',  'csr'),
   ]);
 }
 
 async function loadBucket(bucket, key) {
-  setPillState(key, 'loading', 'Loading...');
+  setPillState(key, 'loading', 'Fetching list...');
   try {
-    // Paginate through ALL results — GCS caps each page at 1000 items
-    let files = [];
-    let pageToken = null;
+    // 1. Collect all file metadata (paginated)
+    let files = [], pageToken = null;
     do {
-      const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o?maxResults=1000${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}&key=${GCS_KEY}`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const url = 'https://storage.googleapis.com/storage/v1/b/' + bucket + '/o?maxResults=1000' +
+        (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '') + '&key=' + GCS_KEY;
+      const res  = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       files = files.concat((data.items || []).filter(f => f.name.endsWith('.json')));
       pageToken = data.nextPageToken || null;
-      if (pageToken) setPillState(key, 'loading', `Loading… (${files.length} so far)`);
     } while (pageToken);
 
     if (!files.length) throw new Error('No JSON files found');
 
+    // 2. Fetch file contents in parallel batches of FETCH_BATCH
     allCalls = allCalls.filter(c => c._source !== key);
+    const newCalls = [];
     let loaded = 0;
-    for (const file of files) {
-      try {
-        const fr = await fetch(`https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(file.name)}?alt=media&key=${GCS_KEY}`);
-        if (fr.ok) {
-          const call = normalize(await fr.json(), key);
-          if (isMeaningful(call)) { allCalls.push(call); loaded++; }
+
+    for (let i = 0; i < files.length; i += FETCH_BATCH) {
+      const batch   = files.slice(i, i + FETCH_BATCH);
+      const results = await Promise.allSettled(
+        batch.map(f =>
+          fetch('https://storage.googleapis.com/storage/v1/b/' + bucket + '/o/' +
+            encodeURIComponent(f.name) + '?alt=media&key=' + GCS_KEY)
+            .then(r => r.ok ? r.json() : null)
+            .catch(() => null)
+        )
+      );
+
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value) {
+          const call = normalize(r.value, key);
+          if (isMeaningful(call)) { newCalls.push(call); loaded++; }
         }
-      } catch(e) { /* skip bad files */ }
+      }
+
+      // Progressive update so cards appear while loading
+      setPillState(key, 'loading', loaded + ' / ' + files.length);
+      allCalls = allCalls.filter(c => c._source !== key).concat(newCalls);
+      allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
+      updateTeamCounts();
+      applyFilters();
     }
-    allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
+
+    saveCache(key, newCalls);
     setPillState(key, 'loaded', loaded + ' calls');
-    updateTeamCounts();
-    applyFilters();
+
   } catch(e) {
     setPillState(key, 'error', e.message.slice(0, 30));
   }
 }
 
 function setPillState(key, state, msg) {
-  document.getElementById(`pill-${key}`).className  = 'bucket-pill ' + (state === 'loaded' ? 'loaded' : state === 'error' ? 'error-state' : 'loading');
-  document.getElementById(`pcount-${key}`).textContent = msg;
+  document.getElementById('pill-' + key).className = 'bucket-pill ' +
+    (state === 'loaded' ? 'loaded' : state === 'error' ? 'error-state' : 'loading');
+  document.getElementById('pcount-' + key).textContent = msg;
 }
 
 // ── Team ──────────────────────────────────────────────────────
 function setTeam(team) {
   activeTeam = team;
-  ['all', 'zito', 'csr'].forEach(t => {
-    document.getElementById(`tbtn-${t}`).className = 'team-btn' + (t === team ? ` active-${t}` : '');
+  ['all','zito','csr'].forEach(t => {
+    document.getElementById('tbtn-' + t).className = 'team-btn' + (t === team ? ' active-' + t : '');
   });
   applyFilters();
 }
@@ -205,6 +218,11 @@ function updateTeamCounts() {
 }
 
 // ── Filters ───────────────────────────────────────────────────
+function scheduleFilter() {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(applyFilters, 200);
+}
+
 function applyFilters() {
   const search   = document.getElementById('searchAgent').value.toLowerCase();
   const from     = document.getElementById('dateFrom').value;
@@ -229,14 +247,17 @@ function applyFilters() {
   });
 
   updateStats(filtered);
+  renderPage = 0;
   renderCards(filtered);
   buildAreaList();
-  document.getElementById('resultsLabel').innerHTML = `Showing <strong>${filtered.length}</strong> of ${allCalls.length} calls`;
+  const shown = Math.min(filtered.length, PAGE_SIZE);
+  document.getElementById('resultsLabel').innerHTML =
+    'Showing <strong>' + shown + '</strong> of ' + filtered.length + ' &middot; ' + allCalls.length + ' total';
 }
 
 function clearFilters() {
-  ['searchAgent', 'dateFrom', 'dateTo'].forEach(id => document.getElementById(id).value = '');
-  ['filterOutcome', 'filterCallType'].forEach(id => document.getElementById(id).value = '');
+  ['searchAgent','dateFrom','dateTo'].forEach(id => document.getElementById(id).value = '');
+  ['filterOutcome','filterCallType'].forEach(id => document.getElementById(id).value = '');
   selectedArea = null;
   closeAiPanel();
   applyFilters();
@@ -254,11 +275,13 @@ function buildAreaList() {
   const areas = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 20);
 
   document.getElementById('areaSection').style.display = 'block';
-  document.getElementById('areaList').innerHTML = areas.map(([area, count]) => `
-    <div class="area-item ${selectedArea === area ? 'selected' : ''}" onclick="selectArea('${area.replace(/'/g, "\\'")}')">
-      <span class="area-name">${area}</span>
-      <span class="area-count">${count}</span>
-    </div>`).join('');
+  document.getElementById('areaList').innerHTML = areas.map(function(pair) {
+    const area = pair[0], count = pair[1];
+    return '<div class="area-item ' + (selectedArea === area ? 'selected' : '') +
+      '" onclick="selectArea(\'' + area.replace(/'/g, "\\'") + '\')">' +
+      '<span class="area-name">' + area + '</span>' +
+      '<span class="area-count">' + count + '</span></div>';
+  }).join('');
 }
 
 function selectArea(area) {
@@ -276,7 +299,7 @@ function updateStats(calls) {
   const scores   = calls.map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
   const avgQA    = scores.length ? (scores.reduce((a,b) => a+b, 0) / scores.length).toFixed(1) + '%' : '—';
 
-  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v || '—'; };
+  const set = function(id, v) { const el = document.getElementById(id); if (el) el.textContent = v || '—'; };
   set('stat-total',    calls.length); set('ss-total',    calls.length);
   set('stat-sales',    sales);        set('ss-sales',    sales);
   set('stat-retained', retained);     set('ss-retained', retained);
@@ -285,25 +308,74 @@ function updateStats(calls) {
   set('stat-qa',       avgQA);        set('ss-qa',       avgQA);
 }
 
-// ── Render Cards ──────────────────────────────────────────────
+// ── Paginated Renderer ────────────────────────────────────────
 function renderCards(calls) {
   const grid = document.getElementById('callGrid');
+  if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+
   if (!calls.length) {
-    grid.innerHTML = `<div class="state-box"><span class="icon">🔍</span><p><strong>No calls match your filters.</strong><br>Try adjusting the filters or date range.</p></div>`;
+    grid.innerHTML = '<div class="state-box"><span class="icon">🔍</span><p><strong>No calls match your filters.</strong><br>Try adjusting the filters or date range.</p></div>';
     return;
   }
-  grid.innerHTML = calls.map((c, i) => buildCard(c, i)).join('');
+
+  const frag = document.createDocumentFragment();
+  calls.slice(0, PAGE_SIZE).forEach(function(c, i) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = buildCard(c, i);
+    frag.appendChild(tmp.firstElementChild);
+  });
+  grid.innerHTML = '';
+  grid.appendChild(frag);
+  renderPage = 1;
+
+  if (calls.length > PAGE_SIZE) attachSentinel(grid, calls);
 }
 
+function attachSentinel(grid, calls) {
+  const sentinel = document.createElement('div');
+  sentinel.className = 'load-sentinel';
+  const remaining = calls.length - renderPage * PAGE_SIZE;
+  sentinel.innerHTML = '<span class="load-more-hint">↓ ' + remaining + ' more</span>';
+  grid.appendChild(sentinel);
+
+  scrollObserver = new IntersectionObserver(function(entries) {
+    if (!entries[0].isIntersecting) return;
+    const start = renderPage * PAGE_SIZE;
+    const slice = calls.slice(start, start + PAGE_SIZE);
+    if (!slice.length) { scrollObserver.disconnect(); sentinel.remove(); return; }
+
+    sentinel.remove();
+    const frag = document.createDocumentFragment();
+    slice.forEach(function(c, i) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = buildCard(c, start + i);
+      frag.appendChild(tmp.firstElementChild);
+    });
+    grid.appendChild(frag);
+    renderPage++;
+
+    const left = calls.length - renderPage * PAGE_SIZE;
+    if (left > 0) attachSentinel(grid, calls);
+    else scrollObserver.disconnect();
+
+    const shown = Math.min(renderPage * PAGE_SIZE, calls.length);
+    document.getElementById('resultsLabel').innerHTML =
+      'Showing <strong>' + shown + '</strong> of ' + calls.length + ' &middot; ' + allCalls.length + ' total';
+  }, { rootMargin: '300px' });
+
+  scrollObserver.observe(sentinel);
+}
+
+// ── Card Builder ──────────────────────────────────────────────
 function buildCard(c, i) {
   const isCsr    = c._source === 'csr';
-  const initials = c.agentName.split(' ').map(w => w[0]||'').join('').toUpperCase().slice(0, 2);
+  const initials = c.agentName.split(' ').map(function(w){ return w[0]||''; }).join('').toUpperCase().slice(0, 2);
   const dateStr  = c._date ? c._date.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'}) : 'Unknown';
   const co       = (c.callOutcome || '').toLowerCase();
   const outCls   = co.includes('sale') || c.saleCompleted ? 'ob-sale'
     : co.includes('retain') ? 'ob-retain'
     : co.includes('lost') || co.includes('cancel') ? 'ob-lost'
-    : ['support','dispatch','technical'].some(k => co.includes(k)) ? 'ob-support'
+    : ['support','dispatch','technical'].some(function(k){ return co.includes(k); }) ? 'ob-support'
     : 'ob-other';
 
   const qa      = c.qaScore;
@@ -313,68 +385,69 @@ function buildCard(c, i) {
 
   const sentHtml = c.sentiment
     ? c.sentiment.includes('->')
-      ? c.sentiment.split('->').map(s => `<span>${s.trim()}</span>`).join('<span class="arr">→</span>')
-      : `<span>${c.sentiment}</span>`
+      ? c.sentiment.split('->').map(function(s){ return '<span>' + s.trim() + '</span>'; }).join('<span class="arr">→</span>')
+      : '<span>' + c.sentiment + '</span>'
     : '';
 
-  const painHtml = c.painPoints?.length
-    ? `<div class="pain-chips">${c.painPoints.map(p => `<span class="pain-chip">${p}</span>`).join('')}</div>`
+  const painHtml = c.painPoints && c.painPoints.length
+    ? '<div class="pain-chips">' + c.painPoints.map(function(p){ return '<span class="pain-chip">' + p + '</span>'; }).join('') + '</div>'
     : '';
+
+  const delay = i < PAGE_SIZE ? 'animation-delay:' + Math.min(i * 20, 300) + 'ms' : '';
 
   const expandHtml = isCsr
-    ? `${c.problemSummary         ? `<div class="exp-section"><div class="exp-title">Problem</div><div class="exp-text">${c.problemSummary}</div></div>` : ''}
-       ${c.troubleshootingSummary ? `<div class="exp-section"><div class="exp-title">Troubleshooting</div><div class="exp-text">${c.troubleshootingSummary}</div></div>` : ''}
-       <div class="exp-grid">
-         ${c.reasonForCalling ? `<div class="exp-item"><div class="cf-label">Reason</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">${c.reasonForCalling}</div></div>` : ''}
-         ${c.holdTime         ? `<div class="exp-item"><div class="cf-label">Duration</div><div class="cf-val">${c.holdTime}</div></div>` : ''}
-         <div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">${c.agentId||'—'}</div></div>
-         <div class="exp-item"><div class="cf-label">Customer</div><div class="cf-val">${c.customerPhone||'—'}</div></div>
-       </div>`
-    : `${c.competitive ? `<div class="exp-section"><div class="exp-title">Competitive Intel</div><div class="exp-text">${c.competitive}</div></div>` : ''}
-       ${c.objections  ? `<div class="exp-section"><div class="exp-title">Objections</div><div class="exp-text">${c.objections}</div></div>` : ''}
-       <div class="exp-grid">
-         ${c.topStrength      ? `<div class="exp-item"><div class="cf-label">Top Strength</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">${c.topStrength}</div></div>` : ''}
-         ${c.areaImprovement  ? `<div class="exp-item"><div class="cf-label">Improve</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">${c.areaImprovement}</div></div>` : ''}
-         ${c.brandPerception  ? `<div class="exp-item"><div class="cf-label">Brand Perception</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">${c.brandPerception}</div></div>` : ''}
-         ${c.futureNeeds      ? `<div class="exp-item"><div class="cf-label">Future Needs</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">${c.futureNeeds}</div></div>` : ''}
-         <div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">${c.agentId||'—'}</div></div>
-         ${c.homeType ? `<div class="exp-item"><div class="cf-label">Home Type</div><div class="cf-val">${c.homeType}</div></div>` : ''}
-       </div>`;
+    ? (c.problemSummary ? '<div class="exp-section"><div class="exp-title">Problem</div><div class="exp-text">' + c.problemSummary + '</div></div>' : '') +
+      (c.troubleshootingSummary ? '<div class="exp-section"><div class="exp-title">Troubleshooting</div><div class="exp-text">' + c.troubleshootingSummary + '</div></div>' : '') +
+      '<div class="exp-grid">' +
+      (c.reasonForCalling ? '<div class="exp-item"><div class="cf-label">Reason</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.reasonForCalling + '</div></div>' : '') +
+      (c.holdTime ? '<div class="exp-item"><div class="cf-label">Duration</div><div class="cf-val">' + c.holdTime + '</div></div>' : '') +
+      '<div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">' + (c.agentId||'—') + '</div></div>' +
+      '<div class="exp-item"><div class="cf-label">Customer</div><div class="cf-val">' + (c.customerPhone||'—') + '</div></div>' +
+      '</div>'
+    : (c.competitive ? '<div class="exp-section"><div class="exp-title">Competitive Intel</div><div class="exp-text">' + c.competitive + '</div></div>' : '') +
+      (c.objections ? '<div class="exp-section"><div class="exp-title">Objections</div><div class="exp-text">' + c.objections + '</div></div>' : '') +
+      '<div class="exp-grid">' +
+      (c.topStrength ? '<div class="exp-item"><div class="cf-label">Top Strength</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.topStrength + '</div></div>' : '') +
+      (c.areaImprovement ? '<div class="exp-item"><div class="cf-label">Improve</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.areaImprovement + '</div></div>' : '') +
+      (c.brandPerception ? '<div class="exp-item"><div class="cf-label">Brand Perception</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.brandPerception + '</div></div>' : '') +
+      (c.futureNeeds ? '<div class="exp-item"><div class="cf-label">Future Needs</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.futureNeeds + '</div></div>' : '') +
+      '<div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">' + (c.agentId||'—') + '</div></div>' +
+      (c.homeType ? '<div class="exp-item"><div class="cf-label">Home Type</div><div class="cf-val">' + c.homeType + '</div></div>' : '') +
+      '</div>';
 
-  return `
-  <div class="call-card" style="animation-delay:${Math.min(i * 30, 400)}ms" onclick="toggleCard(this)">
-    <div class="card-top">
-      <div class="avatar ${isCsr ? 'csr' : ''}">${initials}</div>
-      <div class="card-agent">
-        <div class="agent-name">${c.agentName}</div>
-        <div class="agent-meta">${dateStr} · ${c.callType}</div>
-      </div>
-      <div class="badges">
-        <span class="src-badge ${isCsr ? 'src-csr' : 'src-zito'}">${isCsr ? 'CSR' : 'Sales'}</span>
-        <span class="out-badge ${outCls}">${c.callOutcome}</span>
-      </div>
-    </div>
-    <div class="card-body">
-      <div class="card-row">
-        <div class="card-field"><span class="cf-label">Area</span><span class="cf-val">${c.serviceArea}</span></div>
-        <div class="card-field"><span class="cf-label">Duration</span><span class="cf-val">${c.duration}</span></div>
-        <div class="card-field"><span class="cf-label">Score</span><span class="cf-val">${c.overallScore || qaLabel}</span></div>
-      </div>
-      <div class="qa-row">
-        <span class="qa-lbl">QA</span>
-        <div class="qa-track"><div class="qa-fill" style="width:${qaWidth};background:${qaColor}"></div></div>
-        <span class="qa-pct" style="color:${qaColor}">${qaLabel}</span>
-      </div>
-      ${c.summary   ? `<div class="card-summary">${c.summary}</div>` : ''}
-      ${painHtml}
-      ${sentHtml    ? `<div class="sentiment">${sentHtml}</div>` : ''}
-    </div>
-    <div class="card-expand">${expandHtml}</div>
-    <div class="card-foot">
-      <span class="foot-file">${c._fileName}</span>
-      <span class="foot-toggle">Details <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 4l4 4 4-4"/></svg></span>
-    </div>
-  </div>`;
+  return '<div class="call-card" style="' + delay + '" onclick="toggleCard(this)">' +
+    '<div class="card-top">' +
+      '<div class="avatar ' + (isCsr ? 'csr' : '') + '">' + initials + '</div>' +
+      '<div class="card-agent">' +
+        '<div class="agent-name">' + c.agentName + '</div>' +
+        '<div class="agent-meta">' + dateStr + ' · ' + c.callType + '</div>' +
+      '</div>' +
+      '<div class="badges">' +
+        '<span class="src-badge ' + (isCsr ? 'src-csr' : 'src-zito') + '">' + (isCsr ? 'CSR' : 'Sales') + '</span>' +
+        '<span class="out-badge ' + outCls + '">' + c.callOutcome + '</span>' +
+      '</div>' +
+    '</div>' +
+    '<div class="card-body">' +
+      '<div class="card-row">' +
+        '<div class="card-field"><span class="cf-label">Area</span><span class="cf-val">' + c.serviceArea + '</span></div>' +
+        '<div class="card-field"><span class="cf-label">Duration</span><span class="cf-val">' + c.duration + '</span></div>' +
+        '<div class="card-field"><span class="cf-label">Score</span><span class="cf-val">' + (c.overallScore || qaLabel) + '</span></div>' +
+      '</div>' +
+      '<div class="qa-row">' +
+        '<span class="qa-lbl">QA</span>' +
+        '<div class="qa-track"><div class="qa-fill" style="width:' + qaWidth + ';background:' + qaColor + '"></div></div>' +
+        '<span class="qa-pct" style="color:' + qaColor + '">' + qaLabel + '</span>' +
+      '</div>' +
+      (c.summary ? '<div class="card-summary">' + c.summary + '</div>' : '') +
+      painHtml +
+      (sentHtml ? '<div class="sentiment">' + sentHtml + '</div>' : '') +
+    '</div>' +
+    '<div class="card-expand">' + expandHtml + '</div>' +
+    '<div class="card-foot">' +
+      '<span class="foot-file">' + c._fileName + '</span>' +
+      '<span class="foot-toggle">Details <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 4l4 4 4-4"/></svg></span>' +
+    '</div>' +
+  '</div>';
 }
 
 function toggleCard(el) { el.classList.toggle('expanded'); }
@@ -386,16 +459,16 @@ function setView(mode) {
   document.getElementById('vbtn-list').classList.toggle('active', mode === 'list');
 }
 
+// ── AI Panel ──────────────────────────────────────────────────
 function getApiKey() {
-  return (document.getElementById('aiApiKey')?.value || '').trim();
+  return (document.getElementById('aiApiKey') && document.getElementById('aiApiKey').value || '').trim();
 }
 
 function onApiKeyInput() {
-  const hasArea = !!selectedArea;
-  const hasKey  = !!getApiKey();
-  document.getElementById('btnAnalyze').disabled = !(hasArea && hasKey);
+  const key = getApiKey();
+  if (key) sessionStorage.setItem('zito_api_key', key);
+  document.getElementById('btnAnalyze').disabled = !(selectedArea && key);
 }
-
 
 function openAiPanel(area) {
   document.getElementById('aiPanel').classList.add('open');
@@ -408,17 +481,17 @@ function openAiPanel(area) {
   const sales     = areaCalls.filter(c => c.saleCompleted || (c.callOutcome||'').toLowerCase().includes('sale')).length;
   const support   = areaCalls.filter(c => ['support','dispatch','technical'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
 
-  document.getElementById('aiBody').innerHTML = `
-    <div class="ai-context">
-      <div class="ai-ctx-row"><span class="ai-ctx-label">Calls in area</span><span class="ai-ctx-val sc">${areaCalls.length}</span></div>
-      <div class="ai-ctx-row"><span class="ai-ctx-label">Avg QA Score</span><span class="ai-ctx-val sa">${avgQA}</span></div>
-      <div class="ai-ctx-row"><span class="ai-ctx-label">Sales</span><span class="ai-ctx-val sg">${sales}</span></div>
-      <div class="ai-ctx-row"><span class="ai-ctx-label">Support calls</span><span class="ai-ctx-val sp">${support}</span></div>
-    </div>
-    <div class="ai-placeholder">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2a10 10 0 110 20A10 10 0 0112 2z"/><path d="M8 12h8M12 8l4 4-4 4"/></svg>
-      <p>Click <strong>Generate AI Analysis</strong><br>for next steps on<br><strong>${area}</strong>.</p>
-    </div>`;
+  document.getElementById('aiBody').innerHTML =
+    '<div class="ai-context">' +
+      '<div class="ai-ctx-row"><span class="ai-ctx-label">Calls in area</span><span class="ai-ctx-val sc">' + areaCalls.length + '</span></div>' +
+      '<div class="ai-ctx-row"><span class="ai-ctx-label">Avg QA Score</span><span class="ai-ctx-val sa">' + avgQA + '</span></div>' +
+      '<div class="ai-ctx-row"><span class="ai-ctx-label">Sales</span><span class="ai-ctx-val sg">' + sales + '</span></div>' +
+      '<div class="ai-ctx-row"><span class="ai-ctx-label">Support calls</span><span class="ai-ctx-val sp">' + support + '</span></div>' +
+    '</div>' +
+    '<div class="ai-placeholder">' +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2a10 10 0 110 20A10 10 0 0112 2z"/><path d="M8 12h8M12 8l4 4-4 4"/></svg>' +
+      '<p>Click <strong>Generate AI Analysis</strong><br>for next steps on<br><strong>' + area + '</strong>.</p>' +
+    '</div>';
 }
 
 function closeAiPanel() {
@@ -432,71 +505,58 @@ function closeAiPanel() {
 async function runAnalysis() {
   const apiKey = getApiKey();
   if (!apiKey) {
-    document.getElementById('aiBody').innerHTML = `<div class="ai-output"><p style="color:var(--red)">Please enter your Anthropic API key above.</p></div>`;
+    document.getElementById('aiBody').innerHTML = '<div class="ai-output"><p style="color:var(--red)">Please enter your Anthropic API key above.</p></div>';
     return;
   }
   const btn = document.getElementById('btnAnalyze');
   btn.disabled = true;
   btn.textContent = 'Analyzing...';
 
-  const areaCalls = allCalls.filter(c => normalizeArea(c.serviceArea) === normalizeArea(selectedArea));
-  const scores    = areaCalls.map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
-  const avgQA     = scores.length ? (scores.reduce((a,b) => a+b, 0) / scores.length).toFixed(1) : 'N/A';
-  const sales     = areaCalls.filter(c => c.saleCompleted || (c.callOutcome||'').toLowerCase().includes('sale')).length;
-  const lost      = areaCalls.filter(c => ['lost','cancel'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
-  const support   = areaCalls.filter(c => ['support','dispatch','technical'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
-
-  const painPoints   = [...new Set(areaCalls.flatMap(c => c.painPoints || []))];
-  const objections   = areaCalls.map(c => c.objections).filter(Boolean).slice(0, 5).join(' | ');
-  const competitive  = areaCalls.map(c => c.competitive).filter(Boolean).slice(0, 3).join(' | ');
-  const sentiments   = [...new Set(areaCalls.map(c => c.sentiment).filter(Boolean))].slice(0, 5);
-  const agents       = [...new Set(areaCalls.map(c => c.agentName))];
-  const agentScores  = agents.map(a => {
+  const areaCalls   = allCalls.filter(c => normalizeArea(c.serviceArea) === normalizeArea(selectedArea));
+  const scores      = areaCalls.map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
+  const avgQA       = scores.length ? (scores.reduce((a,b) => a+b, 0) / scores.length).toFixed(1) : 'N/A';
+  const sales       = areaCalls.filter(c => c.saleCompleted || (c.callOutcome||'').toLowerCase().includes('sale')).length;
+  const lost        = areaCalls.filter(c => ['lost','cancel'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
+  const support     = areaCalls.filter(c => ['support','dispatch','technical'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
+  const painPoints  = [...new Set(areaCalls.flatMap(c => c.painPoints || []))];
+  const objections  = areaCalls.map(c => c.objections).filter(Boolean).slice(0, 5).join(' | ');
+  const competitive = areaCalls.map(c => c.competitive).filter(Boolean).slice(0, 3).join(' | ');
+  const sentiments  = [...new Set(areaCalls.map(c => c.sentiment).filter(Boolean))].slice(0, 5);
+  const agents      = [...new Set(areaCalls.map(c => c.agentName))];
+  const agentScores = agents.map(a => {
     const s = areaCalls.filter(c => c.agentName === a).map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
-    return s.length ? `${a}: ${(s.reduce((x,y) => x+y, 0) / s.length).toFixed(1)}%` : null;
+    return s.length ? a + ': ' + (s.reduce((x,y) => x+y, 0) / s.length).toFixed(1) + '%' : null;
   }).filter(Boolean);
 
-  const prompt = `You are a telecom sales and customer service operations analyst. Analyze this call data for the service area "${selectedArea}" and provide specific, actionable next steps.
-
-SERVICE AREA: ${selectedArea}
-TOTAL CALLS: ${areaCalls.length}
-AVERAGE QA SCORE: ${avgQA}%
-SALES: ${sales} | LOST/CANCELED: ${lost} | SUPPORT/TECHNICAL: ${support}
-AGENT QA SCORES: ${agentScores.join(', ') || 'N/A'}
-COMMON PAIN POINTS: ${painPoints.join(', ') || 'None identified'}
-CUSTOMER OBJECTIONS: ${objections || 'None noted'}
-COMPETITIVE INTEL: ${competitive || 'None noted'}
-CUSTOMER SENTIMENTS: ${sentiments.join(', ') || 'N/A'}
-
-Respond in this exact format with specific, data-driven recommendations:
-
-### Sales Performance
-[2-3 bullet points about what's working and what needs improvement based on the data]
-
-### Key Coaching Actions
-[3-4 specific coaching actions for agents in this area based on objections/scores]
-
-### Competitive Strategy
-[2-3 bullet points on how to handle the competitive threats seen in this area]
-
-### Customer Experience
-[2-3 bullet points on addressing pain points and improving sentiment]
-
-### Immediate Next Steps
-[3 concrete, prioritized action items numbered 1-3]
-
-Be specific, data-driven, and concise. Reference actual numbers from the data.`;
+  const prompt =
+    'You are a telecom sales and customer service operations analyst. Analyze this call data for the service area "' + selectedArea + '" and provide specific, actionable next steps.\n\n' +
+    'SERVICE AREA: ' + selectedArea + '\n' +
+    'TOTAL CALLS: ' + areaCalls.length + '\n' +
+    'AVERAGE QA SCORE: ' + avgQA + '%\n' +
+    'SALES: ' + sales + ' | LOST/CANCELED: ' + lost + ' | SUPPORT/TECHNICAL: ' + support + '\n' +
+    'AGENT QA SCORES: ' + (agentScores.join(', ') || 'N/A') + '\n' +
+    'COMMON PAIN POINTS: ' + (painPoints.join(', ') || 'None identified') + '\n' +
+    'CUSTOMER OBJECTIONS: ' + (objections || 'None noted') + '\n' +
+    'COMPETITIVE INTEL: ' + (competitive || 'None noted') + '\n' +
+    'CUSTOMER SENTIMENTS: ' + (sentiments.join(', ') || 'N/A') + '\n\n' +
+    'Respond in this exact format:\n\n' +
+    '### Sales Performance\n[2-3 bullet points about what\'s working and what needs improvement]\n\n' +
+    '### Key Coaching Actions\n[3-4 specific coaching actions based on objections/scores]\n\n' +
+    '### Competitive Strategy\n[2-3 bullet points on handling competitive threats]\n\n' +
+    '### Customer Experience\n[2-3 bullet points on addressing pain points and improving sentiment]\n\n' +
+    '### Immediate Next Steps\n[3 concrete, prioritized action items numbered 1-3]\n\n' +
+    'Be specific, data-driven, and concise. Reference actual numbers.';
 
   const body = document.getElementById('aiBody');
-  const ctx  = body.querySelector('.ai-context')?.outerHTML || '';
-  body.innerHTML = ctx + `<div class="ai-loading"><div class="spinner"></div> Analyzing ${areaCalls.length} calls in ${selectedArea}...</div>`;
+  const ctx  = (body.querySelector('.ai-context') || {outerHTML:''}).outerHTML;
+  body.innerHTML = ctx + '<div class="ai-loading"><div class="spinner"></div> Analyzing ' + areaCalls.length + ' calls in ' + selectedArea + '...</div>';
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
-        'Content-Type':  'application/json',
-        'x-api-key':     apiKey,
+        'Content-Type': 'application/json',
+        'x-api-key':    apiKey,
         'anthropic-version': '2023-06-01',
         'anthropic-dangerous-direct-browser-access': 'true',
       },
@@ -506,12 +566,11 @@ Be specific, data-driven, and concise. Reference actual numbers from the data.`;
         messages:   [{ role: 'user', content: prompt }],
       }),
     });
-
     const data = await response.json();
-    const text = data.content?.[0]?.text || 'No analysis returned.';
-    body.innerHTML = ctx + `<div class="ai-output">${markdownToHtml(text)}</div>`;
+    const text = (data.content && data.content[0] && data.content[0].text) || 'No analysis returned.';
+    body.innerHTML = ctx + '<div class="ai-output">' + markdownToHtml(text) + '</div>';
   } catch(e) {
-    body.innerHTML = ctx + `<div class="ai-output"><p style="color:var(--red)">Analysis failed: ${e.message}</p></div>`;
+    body.innerHTML = ctx + '<div class="ai-output"><p style="color:var(--red)">Analysis failed: ' + e.message + '</p></div>';
   }
 
   btn.disabled    = false;
@@ -524,7 +583,7 @@ function markdownToHtml(md) {
     .replace(/\*\*(.+?)\*\*/g,   '<strong>$1</strong>')
     .replace(/^[-•] (.+)$/gm,    '<li>$1</li>')
     .replace(/^(\d+)\. (.+)$/gm, '<div class="ai-action-item"><strong>$1.</strong> $2</div>')
-    .replace(/(<li>.*<\/li>\n?)+/g, match => `<ul>${match}</ul>`)
+    .replace(/(<li>.*<\/li>\n?)+/g, function(m){ return '<ul>' + m + '</ul>'; })
     .replace(/\n\n/g, '</p><p>')
     .replace(/^(?!<[hup])(.+)$/gm, '<p>$1</p>')
     .replace(/<p><\/p>/g, '');
