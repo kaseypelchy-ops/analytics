@@ -1,6 +1,6 @@
 // ── Config ────────────────────────────────────────────────────
 const GCS_KEY = 'AIzaSyAdsm31FX6Mp5x5IoHDWn1UkUpVUqRBEdk';
-const AI_KEY  = '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';
+// API key is entered by the user in the AI panel — never hardcoded
 const CACHE_KEY  = 'zito_calls_cache';
 const CACHE_META = 'zito_calls_meta';
 
@@ -75,7 +75,16 @@ function normalize(raw, source) {
   }
 }
 
-// ── Cache helpers ─────────────────────────────────────────────
+// ── Meaningfulness Check ──────────────────────────────────────
+// Returns false if the call record is essentially all N/A / empty / unknown
+function isMeaningful(c) {
+  const blank = v => !v || ['n/a', 'na', 'unknown', 'none', 'null', '—', '-', ''].includes(String(v).toLowerCase().trim());
+  const keyFields = [c.agentName, c.serviceArea, c.callOutcome, c.callType, c.qaScore, c.summary, c.sentiment];
+  const meaningfulCount = keyFields.filter(v => !blank(v)).length;
+  return meaningfulCount >= 2; // require at least 2 real fields
+}
+
+
 function saveCache(source, calls) {
   try {
     const meta = JSON.parse(localStorage.getItem(CACHE_META) || '{}');
@@ -160,7 +169,10 @@ async function loadBucket(bucket, key) {
     for (const file of files) {
       try {
         const fr = await fetch(`https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(file.name)}?alt=media&key=${GCS_KEY}`);
-        if (fr.ok) { allCalls.push(normalize(await fr.json(), key)); loaded++; }
+        if (fr.ok) {
+          const call = normalize(await fr.json(), key);
+          if (isMeaningful(call)) { allCalls.push(call); loaded++; }
+        }
       } catch(e) { /* skip bad files */ }
     }
     allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
@@ -374,11 +386,21 @@ function setView(mode) {
   document.getElementById('vbtn-list').classList.toggle('active', mode === 'list');
 }
 
-// ── AI Panel ──────────────────────────────────────────────────
+function getApiKey() {
+  return (document.getElementById('aiApiKey')?.value || '').trim();
+}
+
+function onApiKeyInput() {
+  const hasArea = !!selectedArea;
+  const hasKey  = !!getApiKey();
+  document.getElementById('btnAnalyze').disabled = !(hasArea && hasKey);
+}
+
+
 function openAiPanel(area) {
   document.getElementById('aiPanel').classList.add('open');
   document.getElementById('aiAreaBadge').textContent = area;
-  document.getElementById('btnAnalyze').disabled = false;
+  document.getElementById('btnAnalyze').disabled = !getApiKey();
 
   const areaCalls = allCalls.filter(c => normalizeArea(c.serviceArea) === normalizeArea(area));
   const scores    = areaCalls.map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
@@ -408,7 +430,11 @@ function closeAiPanel() {
 }
 
 async function runAnalysis() {
-  if (!selectedArea) return;
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    document.getElementById('aiBody').innerHTML = `<div class="ai-output"><p style="color:var(--red)">Please enter your Anthropic API key above.</p></div>`;
+    return;
+  }
   const btn = document.getElementById('btnAnalyze');
   btn.disabled = true;
   btn.textContent = 'Analyzing...';
@@ -470,7 +496,7 @@ Be specific, data-driven, and concise. Reference actual numbers from the data.`;
       method: 'POST',
       headers: {
         'Content-Type':  'application/json',
-        'x-api-key':     AI_KEY,
+        'x-api-key':     apiKey,
         'anthropic-version': '2023-06-01',
         'anthropic-dangerous-direct-browser-access': 'true',
       },

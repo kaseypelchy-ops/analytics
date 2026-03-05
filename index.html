@@ -189,6 +189,10 @@
       </div>
 
       <div class="ai-footer">
+        <div class="ai-key-row">
+          <label class="ai-key-label">Anthropic API Key</label>
+          <input type="password" class="ai-key-input" id="aiApiKey" placeholder="sk-ant-..." oninput="onApiKeyInput()" />
+        </div>
         <button class="btn-analyze" id="btnAnalyze" onclick="runAnalysis()" disabled>
           ✦ Generate AI Analysis
         </button>
