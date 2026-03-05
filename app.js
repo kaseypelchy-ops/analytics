@@ -140,10 +140,19 @@ async function loadAll(forceRefresh = false) {
 async function loadBucket(bucket, key) {
   setPillState(key, 'loading', 'Loading...');
   try {
-    const res = await fetch(`https://storage.googleapis.com/storage/v1/b/${bucket}/o?maxResults=1000&key=${GCS_KEY}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data  = await res.json();
-    const files = (data.items || []).filter(f => f.name.endsWith('.json'));
+    // Paginate through ALL results — GCS caps each page at 1000 items
+    let files = [];
+    let pageToken = null;
+    do {
+      const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o?maxResults=1000${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}&key=${GCS_KEY}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      files = files.concat((data.items || []).filter(f => f.name.endsWith('.json')));
+      pageToken = data.nextPageToken || null;
+      if (pageToken) setPillState(key, 'loading', `Loading… (${files.length} so far)`);
+    } while (pageToken);
+
     if (!files.length) throw new Error('No JSON files found');
 
     allCalls = allCalls.filter(c => c._source !== key);
