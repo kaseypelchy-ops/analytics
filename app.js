@@ -491,72 +491,126 @@ function buildCard(c, i) {
   const dateStr  = c._date ? c._date.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : 'Unknown';
   const cls      = classifyOutcome(c);
   const outCls   = cls==='sale' ? 'ob-sale' : cls==='retain' ? 'ob-retain' : cls==='lost' ? 'ob-lost' : cls==='support' ? 'ob-support' : 'ob-other';
+  const cardCls  = 'oc-'+cls;
   const qa       = c.qaScore;
   const qaColor  = qa!==null ? (qa>=80?'var(--green)':qa>=60?'var(--amber)':'var(--red)') : 'var(--text3)';
   const qaWidth  = qa!==null ? qa+'%' : '0%';
   const qaLabel  = qa!==null ? qa+'%' : '—';
   const delay    = i < PAGE_SIZE ? 'animation-delay:'+Math.min(i*20,300)+'ms' : '';
 
+  // Sentiment chips
   const sentHtml = c.sentiment
     ? (c.sentiment.includes('->')
-        ? c.sentiment.split('->').map(s=>'<span>'+s.trim()+'</span>').join('<span class="arr">→</span>')
+        ? c.sentiment.split('->').map(s=>'<span>'+s.trim()+'</span>').join('<span class="arr"> → </span>')
         : '<span>'+c.sentiment+'</span>')
     : '';
 
+  // Pain point chips
   const painHtml = c.painPoints&&c.painPoints.length
-    ? '<div class="pain-chips">'+c.painPoints.map(p=>'<span class="pain-chip">'+p+'</span>').join('')+'</div>'
+    ? '<div class="pain-chips">'+c.painPoints.slice(0,4).map(p=>'<span class="pain-chip">'+p+'</span>').join('')+'</div>'
     : '';
 
-  const expandHtml = isCsr
-    ? (c.problemSummary ? '<div class="exp-section"><div class="exp-title">Problem</div><div class="exp-text">'+c.problemSummary+'</div></div>' : '')
-      + (c.troubleshootingSummary ? '<div class="exp-section"><div class="exp-title">Troubleshooting</div><div class="exp-text">'+c.troubleshootingSummary+'</div></div>' : '')
-      + '<div class="exp-grid">'
-      + (c.reasonForCalling ? '<div class="exp-item"><div class="cf-label">Reason</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.reasonForCalling+'</div></div>' : '')
-      + (c.holdTime ? '<div class="exp-item"><div class="cf-label">Duration</div><div class="cf-val">'+c.holdTime+'</div></div>' : '')
-      + '<div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">'+(c.agentId||'—')+'</div></div>'
-      + '<div class="exp-item"><div class="cf-label">Customer</div><div class="cf-val">'+(c.customerPhone||'—')+'</div></div>'
-      + '</div>'
-    : (c.competitive ? '<div class="exp-section"><div class="exp-title">Competitive Intel</div><div class="exp-text">'+c.competitive+'</div></div>' : '')
-      + (c.objections ? '<div class="exp-section"><div class="exp-title">Objections</div><div class="exp-text">'+c.objections+'</div></div>' : '')
-      + '<div class="exp-grid">'
-      + (c.topStrength ? '<div class="exp-item"><div class="cf-label">Top Strength</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.topStrength+'</div></div>' : '')
-      + (c.areaImprovement ? '<div class="exp-item"><div class="cf-label">Improve</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.areaImprovement+'</div></div>' : '')
-      + (c.brandPerception ? '<div class="exp-item"><div class="cf-label">Brand Perception</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.brandPerception+'</div></div>' : '')
-      + (c.futureNeeds ? '<div class="exp-item"><div class="cf-label">Future Needs</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.futureNeeds+'</div></div>' : '')
-      + '<div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">'+(c.agentId||'—')+'</div></div>'
-      + (c.homeType ? '<div class="exp-item"><div class="cf-label">Home Type</div><div class="cf-val">'+c.homeType+'</div></div>' : '')
-      + '</div>';
+  // ── Meta pills row (Area · Duration · Call Type) ──
+  const metaHtml =
+    '<div class="card-meta-row">'
+    +(c.serviceArea && c.serviceArea!=='Unknown'
+      ? '<span class="meta-pill"><span class="meta-pill-label">Area</span><span class="meta-pill-sep"> · </span><span class="meta-pill-val">'+c.serviceArea+'</span></span>'
+      : '')
+    +(c.duration && c.duration!=='—'
+      ? '<span class="meta-pill"><span class="meta-pill-label">Duration</span><span class="meta-pill-sep"> · </span><span class="meta-pill-val">'+c.duration+'</span></span>'
+      : '')
+    +(c.callType && c.callType!=='Unknown'
+      ? '<span class="meta-pill"><span class="meta-pill-label">Type</span><span class="meta-pill-sep"> · </span><span class="meta-pill-val">'+c.callType+'</span></span>'
+      : '')
+    +(c.homeType
+      ? '<span class="meta-pill"><span class="meta-pill-label">Home</span><span class="meta-pill-sep"> · </span><span class="meta-pill-val">'+c.homeType+'</span></span>'
+      : '')
+    +'</div>';
 
-  return '<div class="call-card" style="'+delay+'" onclick="toggleCard(this)">'
+  // ── Expand section ──
+  const expItem = (label, val) =>
+    val ? '<div class="exp-item"><div class="cf-label">'+label+'</div><div class="cf-val">'+val+'</div></div>' : '';
+
+  const expSection = (title, text) =>
+    text ? '<div class="exp-section"><div class="exp-title">'+title+'</div><div class="exp-text">'+text+'</div></div>' : '';
+
+  const expandHtml = '<div class="exp-inner">'
+    + (isCsr
+        ? expSection('Problem Description', c.problemSummary)
+          + expSection('Troubleshooting Steps', c.troubleshootingSummary)
+          + (c.reasonForCalling||c.holdTime||c.agentId||c.customerPhone
+              ? '<div class="exp-grid">'
+                + expItem('Reason for Calling', c.reasonForCalling)
+                + expItem('Hold / Total Time', c.holdTime)
+                + expItem('Agent ID', c.agentId||'—')
+                + expItem('Customer Phone', c.customerPhone||'—')
+                +'</div>'
+              : '')
+        : expSection('Competitive Intel', c.competitive)
+          + expSection('Customer Objections', c.objections)
+          + (c.topStrength||c.areaImprovement||c.brandPerception||c.futureNeeds||c.agentId
+              ? '<div class="exp-grid">'
+                + expItem('Top Strength', c.topStrength)
+                + expItem('Area to Improve', c.areaImprovement)
+                + expItem('Brand Perception', c.brandPerception)
+                + expItem('Future Needs', c.futureNeeds)
+                + expItem('Agent ID', c.agentId||'—')
+                + expItem('Customer Phone', c.customerPhone||'—')
+                +'</div>'
+              : '')
+      )
+    +'</div>';
+
+  return '<div class="call-card '+cardCls+'" style="'+delay+'" onclick="toggleCard(this)">'
+
+    // ── Header ──
     +'<div class="card-top">'
       +'<div class="avatar '+(isCsr?'csr':'')+'">'+initials+'</div>'
-      +'<div class="card-agent"><div class="agent-name">'+c.agentName+'</div>'
-        +'<div class="agent-meta">'+dateStr+' · '+c.callType+'</div></div>'
+      +'<div class="card-agent">'
+        +'<div class="agent-name">'+c.agentName+'</div>'
+        +'<div class="agent-meta">'+dateStr+(c.agentId?' · ID: '+c.agentId:'')+'</div>'
+      +'</div>'
       +'<div class="badges">'
         +'<span class="src-badge '+(isCsr?'src-csr':'src-zito')+'">'+(isCsr?'CSR':'Sales')+'</span>'
         +'<span class="out-badge '+outCls+'">'+c.callOutcome+'</span>'
       +'</div>'
     +'</div>'
+
+    // ── Meta pills ──
+    + metaHtml
+
+    // ── Body ──
     +'<div class="card-body">'
-      +'<div class="card-row">'
-        +'<div class="card-field"><span class="cf-label">Area</span><span class="cf-val">'+c.serviceArea+'</span></div>'
-        +'<div class="card-field"><span class="cf-label">Duration</span><span class="cf-val">'+c.duration+'</span></div>'
-        +'<div class="card-field"><span class="cf-label">Score</span><span class="cf-val">'+(c.overallScore||qaLabel)+'</span></div>'
-      +'</div>'
-      +'<div class="qa-row">'
-        +'<span class="qa-lbl">QA</span>'
-        +'<div class="qa-track"><div class="qa-fill" style="width:'+qaWidth+';background:'+qaColor+'"></div></div>'
-        +'<span class="qa-pct" style="color:'+qaColor+'">'+qaLabel+'</span>'
-      +'</div>'
+
+      // QA score bar
+      +(qa!==null
+        ? '<div class="qa-row">'
+            +'<span class="qa-lbl">QA Score</span>'
+            +'<div class="qa-track"><div class="qa-fill" style="width:'+qaWidth+';background:'+qaColor+'"></div></div>'
+            +'<span class="qa-pct" style="color:'+qaColor+'">'+qaLabel+'</span>'
+          +'</div>'
+        : '')
+
+      // Summary text
       +(c.summary ? '<div class="card-summary">'+c.summary+'</div>' : '')
-      +painHtml
+
+      // Pain chips
+      + painHtml
+
+      // Sentiment journey
       +(sentHtml ? '<div class="sentiment">'+sentHtml+'</div>' : '')
+
     +'</div>'
+
+    // ── Expanded details ──
     +'<div class="card-expand">'+expandHtml+'</div>'
+
+    // ── Footer ──
     +'<div class="card-foot">'
       +'<span class="foot-file">'+c._fileName+'</span>'
       +'<span class="foot-toggle">Details <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 4l4 4 4-4"/></svg></span>'
     +'</div>'
+
   +'</div>';
 }
 
