@@ -2,22 +2,22 @@
 const GCS_KEY    = 'AIzaSyAdsm31FX6Mp5x5IoHDWn1UkUpVUqRBEdk';
 const CACHE_KEY  = 'zito_calls_cache';
 const CACHE_META = 'zito_calls_meta';
-const PAGE_SIZE   = 50;   // cards rendered per page
-const FETCH_BATCH = 20;   // concurrent GCS file fetches
+const PAGE_SIZE   = 50;   // cards per render page
+const FETCH_BATCH = 20;   // concurrent GCS fetches
 
 // ── State ─────────────────────────────────────────────────────
-let allCalls     = [];
-let filtered     = [];
-let activeTeam   = 'all';
-let selectedArea = null;
-let renderPage   = 0;
-let filterTimer  = null;
-let scrollObserver = null;
+let allCalls      = [];
+let filtered      = [];
+let activeTeam    = 'all';
+let selectedArea  = null;
+let renderPage    = 0;
+let filterTimer   = null;
+let scrollObs     = null;
 
 // ── Init ──────────────────────────────────────────────────────
 window.addEventListener('load', () => {
-  const savedKey = sessionStorage.getItem('zito_api_key');
-  if (savedKey) document.getElementById('aiApiKey').value = savedKey;
+  const k = sessionStorage.getItem('zito_api_key');
+  if (k) document.getElementById('aiApiKey').value = k;
 });
 
 // ── Schema Normalizer ─────────────────────────────────────────
@@ -71,12 +71,12 @@ function normalize(raw, source) {
       duration:     meta.call_duration_minutes ? parseFloat(meta.call_duration_minutes).toFixed(1) + ' min' : '—',
       sentiment:    det.customer_sentiment_standardized || '',
       summary:      det.problem_description_summary     || '',
-      problemSummary:         det.problem_description_summary  || '',
+      problemSummary:         det.problem_description_summary   || '',
       troubleshootingSummary: det.troubleshooting_steps_summary || '',
       painPoints:   Array.isArray(det.pain_points) ? det.pain_points : [],
       saleCompleted:    false,
       brandPerception:  '', futureNeeds: '', topStrength: '', areaImprovement: '',
-      competitive:      '', objections:  '', homeType: '',
+      competitive:      '', objections: '', homeType: '',
       customerPhone:    meta.customer_phone_number || '',
       agentId:          meta.agent_id || '',
       reasonForCalling: det.reason_for_calling || '',
@@ -85,11 +85,23 @@ function normalize(raw, source) {
   }
 }
 
-// ── Meaningfulness Check ──────────────────────────────────────
+// ── Classify call into ONE exclusive outcome bucket ───────────
+// Priority: sale > lost > retain > support > other
+function classifyOutcome(c) {
+  const co = (c.callOutcome || '').toLowerCase();
+  if (c.saleCompleted || co.includes('sale'))                                          return 'sale';
+  if (['lost','cancel'].some(k => co.includes(k)))                                     return 'lost';
+  if (co.includes('retain'))                                                            return 'retain';
+  if (['support','dispatch','technical','repair','outage'].some(k => co.includes(k)))  return 'support';
+  return 'other';
+}
+
+// ── Meaningfulness gate — drop files that are truly empty ─────
+// Only 1 real field required; this catches blank {} JSON files
 function isMeaningful(c) {
   const blank = v => !v || ['n/a','na','unknown','none','null','—','-',''].includes(String(v).toLowerCase().trim());
-  const keyFields = [c.agentName, c.serviceArea, c.callOutcome, c.callType, c.qaScore, c.summary, c.sentiment];
-  return keyFields.filter(v => !blank(v)).length >= 2;
+  return [c.agentName, c.serviceArea, c.callOutcome, c.callType, c.qaScore, c.summary, c.sentiment]
+    .some(v => !blank(v));
 }
 
 // ── Cache ─────────────────────────────────────────────────────
@@ -98,8 +110,7 @@ function saveCache(source, calls) {
     const meta = JSON.parse(localStorage.getItem(CACHE_META) || '{}');
     meta[source] = { lastLoaded: new Date().toISOString(), count: calls.length };
     localStorage.setItem(CACHE_META, JSON.stringify(meta));
-    const existing   = JSON.parse(localStorage.getItem(CACHE_KEY) || '[]');
-    const others     = existing.filter(c => c._source !== source);
+    const others     = JSON.parse(localStorage.getItem(CACHE_KEY) || '[]').filter(c => c._source !== source);
     const serialized = calls.map(c => ({ ...c, _date: c._date ? c._date.toISOString() : null }));
     localStorage.setItem(CACHE_KEY, JSON.stringify([...others, ...serialized]));
   } catch(e) { console.warn('Cache save failed:', e); }
@@ -118,15 +129,15 @@ function clearCache() {
   localStorage.removeItem(CACHE_META);
 }
 
-// ── Bucket Loader ─────────────────────────────────────────────
+// ── Loader ────────────────────────────────────────────────────
 async function loadAll(forceRefresh = false) {
   if (!forceRefresh) {
     const cached = loadCache();
     if (cached.length > 0) {
       allCalls = cached;
-      allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
-      updateTeamCounts();
-      applyFilters();
+      allCalls.sort((a, b) => (b._date||0) - (a._date||0));
+      updateTeamCounts(); applyFilters();
+      // background refresh
       loadBucket('zito-json-summaries', 'zito');
       loadBucket('csr-json-summaries',  'csr');
       return;
@@ -141,14 +152,15 @@ async function loadAll(forceRefresh = false) {
 }
 
 async function loadBucket(bucket, key) {
-  setPillState(key, 'loading', 'Fetching list...');
+  setPillState(key, 'loading', 'Fetching list…');
   try {
-    // 1. Collect all file metadata (paginated)
+    // ── Paginate the file listing (GCS caps at 1000/page) ──
     let files = [], pageToken = null;
     do {
-      const url = 'https://storage.googleapis.com/storage/v1/b/' + bucket + '/o?maxResults=1000' +
-        (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '') + '&key=' + GCS_KEY;
-      const res  = await fetch(url);
+      const url = 'https://storage.googleapis.com/storage/v1/b/' + bucket +
+        '/o?maxResults=1000' + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '') +
+        '&key=' + GCS_KEY;
+      const res = await fetch(url);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       files = files.concat((data.items || []).filter(f => f.name.endsWith('.json')));
@@ -157,19 +169,18 @@ async function loadBucket(bucket, key) {
 
     if (!files.length) throw new Error('No JSON files found');
 
-    // 2. Fetch file contents in parallel batches of FETCH_BATCH
+    // ── Fetch contents in parallel batches ──────────────────
     allCalls = allCalls.filter(c => c._source !== key);
     const newCalls = [];
-    let loaded = 0;
+    let loaded = 0, skipped = 0;
 
     for (let i = 0; i < files.length; i += FETCH_BATCH) {
       const batch   = files.slice(i, i + FETCH_BATCH);
       const results = await Promise.allSettled(
         batch.map(f =>
-          fetch('https://storage.googleapis.com/storage/v1/b/' + bucket + '/o/' +
-            encodeURIComponent(f.name) + '?alt=media&key=' + GCS_KEY)
-            .then(r => r.ok ? r.json() : null)
-            .catch(() => null)
+          fetch('https://storage.googleapis.com/storage/v1/b/' + bucket +
+            '/o/' + encodeURIComponent(f.name) + '?alt=media&key=' + GCS_KEY)
+            .then(r => r.ok ? r.json() : null).catch(() => null)
         )
       );
 
@@ -177,19 +188,19 @@ async function loadBucket(bucket, key) {
         if (r.status === 'fulfilled' && r.value) {
           const call = normalize(r.value, key);
           if (isMeaningful(call)) { newCalls.push(call); loaded++; }
+          else skipped++;
         }
       }
 
-      // Progressive update so cards appear while loading
+      // Progressive update — cards appear while still loading
       setPillState(key, 'loading', loaded + ' / ' + files.length);
       allCalls = allCalls.filter(c => c._source !== key).concat(newCalls);
-      allCalls.sort((a, b) => (b._date || 0) - (a._date || 0));
-      updateTeamCounts();
-      applyFilters();
+      allCalls.sort((a, b) => (b._date||0) - (a._date||0));
+      updateTeamCounts(); applyFilters();
     }
 
     saveCache(key, newCalls);
-    setPillState(key, 'loaded', loaded + ' calls');
+    setPillState(key, 'loaded', loaded + ' calls' + (skipped ? ' (' + skipped + ' blank)' : ''));
 
   } catch(e) {
     setPillState(key, 'error', e.message.slice(0, 30));
@@ -205,9 +216,8 @@ function setPillState(key, state, msg) {
 // ── Team ──────────────────────────────────────────────────────
 function setTeam(team) {
   activeTeam = team;
-  ['all','zito','csr'].forEach(t => {
-    document.getElementById('tbtn-' + t).className = 'team-btn' + (t === team ? ' active-' + t : '');
-  });
+  ['all','zito','csr'].forEach(t =>
+    document.getElementById('tbtn-' + t).className = 'team-btn' + (t === team ? ' active-' + t : ''));
   applyFilters();
 }
 
@@ -218,10 +228,7 @@ function updateTeamCounts() {
 }
 
 // ── Filters ───────────────────────────────────────────────────
-function scheduleFilter() {
-  clearTimeout(filterTimer);
-  filterTimer = setTimeout(applyFilters, 200);
-}
+function scheduleFilter() { clearTimeout(filterTimer); filterTimer = setTimeout(applyFilters, 200); }
 
 function applyFilters() {
   const search   = document.getElementById('searchAgent').value.toLowerCase();
@@ -233,16 +240,18 @@ function applyFilters() {
   filtered = allCalls.filter(c => {
     if (activeTeam !== 'all' && c._source !== activeTeam) return false;
     if (selectedArea && normalizeArea(c.serviceArea) !== normalizeArea(selectedArea)) return false;
-    if (search && !(c.agentName || '').toLowerCase().includes(search)) return false;
+    if (search && !(c.agentName||'').toLowerCase().includes(search)) return false;
     const d = c._date;
     if (from && (!d || d < new Date(from))) return false;
     if (to   && (!d || d > new Date(to + 'T23:59:59'))) return false;
-    const co = (c.callOutcome || '').toLowerCase();
-    if (outcome === 'sale'    && !(co.includes('sale')   || c.saleCompleted)) return false;
-    if (outcome === 'retain'  && !co.includes('retain'))  return false;
-    if (outcome === 'support' && !['support','dispatch','technical'].some(k => co.includes(k))) return false;
-    if (outcome === 'lost'    && !['lost','cancel'].some(k => co.includes(k))) return false;
-    if (callType && !(c.callType || '').toLowerCase().includes(callType)) return false;
+    if (outcome) {
+      const cls = classifyOutcome(c);
+      if (outcome === 'sale'    && cls !== 'sale')    return false;
+      if (outcome === 'retain'  && cls !== 'retain')  return false;
+      if (outcome === 'support' && cls !== 'support') return false;
+      if (outcome === 'lost'    && cls !== 'lost')    return false;
+    }
+    if (callType && !(c.callType||'').toLowerCase().includes(callType)) return false;
     return true;
   });
 
@@ -250,20 +259,19 @@ function applyFilters() {
   renderPage = 0;
   renderCards(filtered);
   buildAreaList();
-  const shown = Math.min(filtered.length, PAGE_SIZE);
+  buildIssuesPanel(filtered);
   document.getElementById('resultsLabel').innerHTML =
-    'Showing <strong>' + shown + '</strong> of ' + filtered.length + ' &middot; ' + allCalls.length + ' total';
+    'Showing <strong>' + Math.min(filtered.length, PAGE_SIZE) + '</strong> of ' +
+    filtered.length + ' &nbsp;·&nbsp; ' + allCalls.length + ' total';
 }
 
 function clearFilters() {
   ['searchAgent','dateFrom','dateTo'].forEach(id => document.getElementById(id).value = '');
   ['filterOutcome','filterCallType'].forEach(id => document.getElementById(id).value = '');
-  selectedArea = null;
-  closeAiPanel();
-  applyFilters();
+  selectedArea = null; closeAiPanel(); applyFilters();
 }
 
-function normalizeArea(a) { return (a || '').toLowerCase().trim(); }
+function normalizeArea(a) { return (a||'').toLowerCase().trim(); }
 
 // ── Area List ─────────────────────────────────────────────────
 function buildAreaList() {
@@ -271,17 +279,15 @@ function buildAreaList() {
   if (!pool.length) { document.getElementById('areaSection').style.display = 'none'; return; }
 
   const counts = {};
-  pool.forEach(c => { const a = c.serviceArea || 'Unknown'; counts[a] = (counts[a] || 0) + 1; });
-  const areas = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 20);
+  pool.forEach(c => { const a = c.serviceArea || 'Unknown'; counts[a] = (counts[a]||0) + 1; });
+  const areas = Object.entries(counts).sort((a,b) => b[1]-a[1]).slice(0, 20);
 
   document.getElementById('areaSection').style.display = 'block';
-  document.getElementById('areaList').innerHTML = areas.map(function(pair) {
-    const area = pair[0], count = pair[1];
-    return '<div class="area-item ' + (selectedArea === area ? 'selected' : '') +
-      '" onclick="selectArea(\'' + area.replace(/'/g, "\\'") + '\')">' +
-      '<span class="area-name">' + area + '</span>' +
-      '<span class="area-count">' + count + '</span></div>';
-  }).join('');
+  document.getElementById('areaList').innerHTML = areas.map(([area, count]) =>
+    '<div class="area-item ' + (selectedArea === area ? 'selected' : '') +
+    '" onclick="selectArea(\'' + area.replace(/'/g,"\\'") + '\')">' +
+    '<span class="area-name">' + area + '</span><span class="area-count">' + count + '</span></div>'
+  ).join('');
 }
 
 function selectArea(area) {
@@ -290,36 +296,151 @@ function selectArea(area) {
   applyFilters();
 }
 
-// ── Stats ─────────────────────────────────────────────────────
-function updateStats(calls) {
-  const sales    = calls.filter(c => c.saleCompleted || (c.callOutcome||'').toLowerCase().includes('sale')).length;
-  const retained = calls.filter(c => (c.callOutcome||'').toLowerCase().includes('retain')).length;
-  const support  = calls.filter(c => ['support','dispatch','technical'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
-  const lost     = calls.filter(c => ['lost','cancel'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
-  const scores   = calls.map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
-  const avgQA    = scores.length ? (scores.reduce((a,b) => a+b, 0) / scores.length).toFixed(1) + '%' : '—';
+// ── Issues Panel ──────────────────────────────────────────────
+function buildIssuesPanel(calls) {
+  const section = document.getElementById('issuesSection');
+  if (!calls.length) { section.style.display = 'none'; return; }
 
-  const set = function(id, v) { const el = document.getElementById(id); if (el) el.textContent = v || '—'; };
+  // Reasons for calling (CSR)
+  const reasonCounts = {};
+  calls.forEach(c => {
+    if (c.reasonForCalling && c.reasonForCalling.toLowerCase() !== 'n/a') {
+      // Normalize and bucket similar reasons
+      const r = c.reasonForCalling.trim();
+      if (r) reasonCounts[r] = (reasonCounts[r]||0) + 1;
+    }
+  });
+
+  // Pain points (CSR)
+  const painCounts = {};
+  calls.forEach(c => (c.painPoints||[]).forEach(p => {
+    const k = p.trim(); if (k) painCounts[k] = (painCounts[k]||0) + 1;
+  }));
+
+  // Objections (Zito)
+  const objCounts = {};
+  calls.forEach(c => {
+    if (c.objections) {
+      c.objections.split(/[,;|]/).forEach(o => {
+        const k = o.trim(); if (k && k.toLowerCase() !== 'n/a') objCounts[k] = (objCounts[k]||0) + 1;
+      });
+    }
+  });
+
+  // Sentiment distribution
+  const sentCounts = {};
+  calls.forEach(c => {
+    if (c.sentiment) {
+      // Take first segment for distribution
+      const s = c.sentiment.split('->')[0].trim();
+      if (s) sentCounts[s] = (sentCounts[s]||0) + 1;
+    }
+  });
+
+  const topReasons = Object.entries(reasonCounts).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  const topPain    = Object.entries(painCounts).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  const topObj     = Object.entries(objCounts).sort((a,b)=>b[1]-a[1]).slice(0,6);
+  const sentList   = Object.entries(sentCounts).sort((a,b)=>b[1]-a[1]);
+
+  const maxReason = topReasons.length ? topReasons[0][1] : 1;
+  const maxPain   = topPain.length    ? topPain[0][1]    : 1;
+
+  function barRow(label, count, max, colorClass) {
+    const pct = Math.round((count / max) * 100);
+    return '<div class="issue-row">' +
+      '<div class="issue-label">' + label + '</div>' +
+      '<div class="issue-bar-wrap">' +
+        '<div class="issue-bar ' + colorClass + '" style="width:' + pct + '%"></div>' +
+      '</div>' +
+      '<div class="issue-count">' + count + '</div>' +
+    '</div>';
+  }
+
+  let html = '';
+
+  if (topReasons.length) {
+    html += '<div class="issues-group"><div class="issues-group-title sp">📋 Reasons for Calling</div>';
+    html += topReasons.map(([l,c]) => barRow(l, c, maxReason, 'ib-purple')).join('');
+    html += '</div>';
+  }
+
+  if (topPain.length) {
+    html += '<div class="issues-group"><div class="issues-group-title sr">⚠️ Pain Points</div>';
+    html += topPain.map(([l,c]) => barRow(l, c, maxPain, 'ib-red')).join('');
+    html += '</div>';
+  }
+
+  if (topObj.length) {
+    html += '<div class="issues-group"><div class="issues-group-title sa">💬 Objections</div>';
+    html += '<div class="obj-chips">' + topObj.map(([l,c]) =>
+      '<span class="obj-chip"><span class="obj-text">' + l + '</span><span class="obj-num">' + c + '</span></span>'
+    ).join('') + '</div></div>';
+  }
+
+  if (sentList.length) {
+    const total = sentList.reduce((s,[,c])=>s+c, 0);
+    html += '<div class="issues-group"><div class="issues-group-title sc">😐 Sentiment</div>';
+    html += '<div class="sent-bars">' + sentList.slice(0,6).map(([s,c]) => {
+      const pct = Math.round(c/total*100);
+      const cls = s.toLowerCase().includes('pos') ? 'sb-green'
+        : s.toLowerCase().includes('neg') || s.toLowerCase().includes('frust') ? 'sb-red'
+        : 'sb-amber';
+      return '<div class="sent-row"><span class="sent-label">' + s + '</span>' +
+        '<div class="sent-track"><div class="sent-fill ' + cls + '" style="width:' + pct + '%"></div></div>' +
+        '<span class="sent-pct">' + pct + '%</span></div>';
+    }).join('') + '</div></div>';
+  }
+
+  if (!html) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  document.getElementById('issuesList').innerHTML = html;
+}
+
+// ── Stats (exclusive categories, always add up) ───────────────
+function updateStats(calls) {
+  let sales = 0, retain = 0, support = 0, lost = 0, other = 0;
+  const scores = [];
+
+  calls.forEach(c => {
+    const cls = classifyOutcome(c);
+    if (cls === 'sale')    sales++;
+    else if (cls === 'lost')    lost++;
+    else if (cls === 'retain')  retain++;
+    else if (cls === 'support') support++;
+    else                        other++;
+    if (c.qaScore !== null && !isNaN(c.qaScore)) scores.push(c.qaScore);
+  });
+
+  const avgQA = scores.length ? (scores.reduce((a,b)=>a+b,0)/scores.length).toFixed(1)+'%' : '—';
+
+  const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent = (v===0?'0':v)||'—'; };
   set('stat-total',    calls.length); set('ss-total',    calls.length);
   set('stat-sales',    sales);        set('ss-sales',    sales);
-  set('stat-retained', retained);     set('ss-retained', retained);
+  set('stat-retained', retain);       set('ss-retained', retain);
   set('stat-support',  support);      set('ss-support',  support);
   set('stat-lost',     lost);         set('ss-lost',     lost);
   set('stat-qa',       avgQA);        set('ss-qa',       avgQA);
+
+  // Update "other" if element exists
+  const otherEl = document.getElementById('stat-other');
+  if (otherEl) otherEl.textContent = other;
+  const ssOther = document.getElementById('ss-other');
+  if (ssOther) ssOther.textContent = other;
 }
 
 // ── Paginated Renderer ────────────────────────────────────────
 function renderCards(calls) {
   const grid = document.getElementById('callGrid');
-  if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+  if (scrollObs) { scrollObs.disconnect(); scrollObs = null; }
 
   if (!calls.length) {
-    grid.innerHTML = '<div class="state-box"><span class="icon">🔍</span><p><strong>No calls match your filters.</strong><br>Try adjusting the filters or date range.</p></div>';
+    grid.innerHTML = '<div class="state-box"><span class="icon">🔍</span>' +
+      '<p><strong>No calls match your filters.</strong><br>Try adjusting the filters or date range.</p></div>';
     return;
   }
 
   const frag = document.createDocumentFragment();
-  calls.slice(0, PAGE_SIZE).forEach(function(c, i) {
+  calls.slice(0, PAGE_SIZE).forEach((c, i) => {
     const tmp = document.createElement('div');
     tmp.innerHTML = buildCard(c, i);
     frag.appendChild(tmp.firstElementChild);
@@ -334,140 +455,127 @@ function renderCards(calls) {
 function attachSentinel(grid, calls) {
   const sentinel = document.createElement('div');
   sentinel.className = 'load-sentinel';
-  const remaining = calls.length - renderPage * PAGE_SIZE;
-  sentinel.innerHTML = '<span class="load-more-hint">↓ ' + remaining + ' more</span>';
+  const left = calls.length - renderPage * PAGE_SIZE;
+  sentinel.innerHTML = '<span class="load-more-hint">↓ ' + left + ' more</span>';
   grid.appendChild(sentinel);
 
-  scrollObserver = new IntersectionObserver(function(entries) {
+  scrollObs = new IntersectionObserver(entries => {
     if (!entries[0].isIntersecting) return;
     const start = renderPage * PAGE_SIZE;
     const slice = calls.slice(start, start + PAGE_SIZE);
-    if (!slice.length) { scrollObserver.disconnect(); sentinel.remove(); return; }
-
+    if (!slice.length) { scrollObs.disconnect(); sentinel.remove(); return; }
     sentinel.remove();
     const frag = document.createDocumentFragment();
-    slice.forEach(function(c, i) {
+    slice.forEach((c, i) => {
       const tmp = document.createElement('div');
       tmp.innerHTML = buildCard(c, start + i);
       frag.appendChild(tmp.firstElementChild);
     });
     grid.appendChild(frag);
     renderPage++;
-
-    const left = calls.length - renderPage * PAGE_SIZE;
-    if (left > 0) attachSentinel(grid, calls);
-    else scrollObserver.disconnect();
-
-    const shown = Math.min(renderPage * PAGE_SIZE, calls.length);
+    const remaining = calls.length - renderPage * PAGE_SIZE;
+    if (remaining > 0) attachSentinel(grid, calls);
+    else scrollObs.disconnect();
     document.getElementById('resultsLabel').innerHTML =
-      'Showing <strong>' + shown + '</strong> of ' + calls.length + ' &middot; ' + allCalls.length + ' total';
+      'Showing <strong>' + Math.min(renderPage * PAGE_SIZE, calls.length) + '</strong> of ' +
+      calls.length + ' &nbsp;·&nbsp; ' + allCalls.length + ' total';
   }, { rootMargin: '300px' });
 
-  scrollObserver.observe(sentinel);
+  scrollObs.observe(sentinel);
 }
 
 // ── Card Builder ──────────────────────────────────────────────
 function buildCard(c, i) {
   const isCsr    = c._source === 'csr';
-  const initials = c.agentName.split(' ').map(function(w){ return w[0]||''; }).join('').toUpperCase().slice(0, 2);
-  const dateStr  = c._date ? c._date.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'}) : 'Unknown';
-  const co       = (c.callOutcome || '').toLowerCase();
-  const outCls   = co.includes('sale') || c.saleCompleted ? 'ob-sale'
-    : co.includes('retain') ? 'ob-retain'
-    : co.includes('lost') || co.includes('cancel') ? 'ob-lost'
-    : ['support','dispatch','technical'].some(function(k){ return co.includes(k); }) ? 'ob-support'
-    : 'ob-other';
-
-  const qa      = c.qaScore;
-  const qaColor = qa !== null ? (qa >= 80 ? 'var(--green)' : qa >= 60 ? 'var(--amber)' : 'var(--red)') : 'var(--text3)';
-  const qaWidth = qa !== null ? qa + '%' : '0%';
-  const qaLabel = qa !== null ? qa + '%' : '—';
+  const initials = c.agentName.split(' ').map(w => w[0]||'').join('').toUpperCase().slice(0,2);
+  const dateStr  = c._date ? c._date.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : 'Unknown';
+  const cls      = classifyOutcome(c);
+  const outCls   = cls==='sale' ? 'ob-sale' : cls==='retain' ? 'ob-retain' : cls==='lost' ? 'ob-lost' : cls==='support' ? 'ob-support' : 'ob-other';
+  const qa       = c.qaScore;
+  const qaColor  = qa!==null ? (qa>=80?'var(--green)':qa>=60?'var(--amber)':'var(--red)') : 'var(--text3)';
+  const qaWidth  = qa!==null ? qa+'%' : '0%';
+  const qaLabel  = qa!==null ? qa+'%' : '—';
+  const delay    = i < PAGE_SIZE ? 'animation-delay:'+Math.min(i*20,300)+'ms' : '';
 
   const sentHtml = c.sentiment
-    ? c.sentiment.includes('->')
-      ? c.sentiment.split('->').map(function(s){ return '<span>' + s.trim() + '</span>'; }).join('<span class="arr">→</span>')
-      : '<span>' + c.sentiment + '</span>'
+    ? (c.sentiment.includes('->')
+        ? c.sentiment.split('->').map(s=>'<span>'+s.trim()+'</span>').join('<span class="arr">→</span>')
+        : '<span>'+c.sentiment+'</span>')
     : '';
 
-  const painHtml = c.painPoints && c.painPoints.length
-    ? '<div class="pain-chips">' + c.painPoints.map(function(p){ return '<span class="pain-chip">' + p + '</span>'; }).join('') + '</div>'
+  const painHtml = c.painPoints&&c.painPoints.length
+    ? '<div class="pain-chips">'+c.painPoints.map(p=>'<span class="pain-chip">'+p+'</span>').join('')+'</div>'
     : '';
-
-  const delay = i < PAGE_SIZE ? 'animation-delay:' + Math.min(i * 20, 300) + 'ms' : '';
 
   const expandHtml = isCsr
-    ? (c.problemSummary ? '<div class="exp-section"><div class="exp-title">Problem</div><div class="exp-text">' + c.problemSummary + '</div></div>' : '') +
-      (c.troubleshootingSummary ? '<div class="exp-section"><div class="exp-title">Troubleshooting</div><div class="exp-text">' + c.troubleshootingSummary + '</div></div>' : '') +
-      '<div class="exp-grid">' +
-      (c.reasonForCalling ? '<div class="exp-item"><div class="cf-label">Reason</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.reasonForCalling + '</div></div>' : '') +
-      (c.holdTime ? '<div class="exp-item"><div class="cf-label">Duration</div><div class="cf-val">' + c.holdTime + '</div></div>' : '') +
-      '<div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">' + (c.agentId||'—') + '</div></div>' +
-      '<div class="exp-item"><div class="cf-label">Customer</div><div class="cf-val">' + (c.customerPhone||'—') + '</div></div>' +
-      '</div>'
-    : (c.competitive ? '<div class="exp-section"><div class="exp-title">Competitive Intel</div><div class="exp-text">' + c.competitive + '</div></div>' : '') +
-      (c.objections ? '<div class="exp-section"><div class="exp-title">Objections</div><div class="exp-text">' + c.objections + '</div></div>' : '') +
-      '<div class="exp-grid">' +
-      (c.topStrength ? '<div class="exp-item"><div class="cf-label">Top Strength</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.topStrength + '</div></div>' : '') +
-      (c.areaImprovement ? '<div class="exp-item"><div class="cf-label">Improve</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.areaImprovement + '</div></div>' : '') +
-      (c.brandPerception ? '<div class="exp-item"><div class="cf-label">Brand Perception</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.brandPerception + '</div></div>' : '') +
-      (c.futureNeeds ? '<div class="exp-item"><div class="cf-label">Future Needs</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">' + c.futureNeeds + '</div></div>' : '') +
-      '<div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">' + (c.agentId||'—') + '</div></div>' +
-      (c.homeType ? '<div class="exp-item"><div class="cf-label">Home Type</div><div class="cf-val">' + c.homeType + '</div></div>' : '') +
-      '</div>';
+    ? (c.problemSummary ? '<div class="exp-section"><div class="exp-title">Problem</div><div class="exp-text">'+c.problemSummary+'</div></div>' : '')
+      + (c.troubleshootingSummary ? '<div class="exp-section"><div class="exp-title">Troubleshooting</div><div class="exp-text">'+c.troubleshootingSummary+'</div></div>' : '')
+      + '<div class="exp-grid">'
+      + (c.reasonForCalling ? '<div class="exp-item"><div class="cf-label">Reason</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.reasonForCalling+'</div></div>' : '')
+      + (c.holdTime ? '<div class="exp-item"><div class="cf-label">Duration</div><div class="cf-val">'+c.holdTime+'</div></div>' : '')
+      + '<div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">'+(c.agentId||'—')+'</div></div>'
+      + '<div class="exp-item"><div class="cf-label">Customer</div><div class="cf-val">'+(c.customerPhone||'—')+'</div></div>'
+      + '</div>'
+    : (c.competitive ? '<div class="exp-section"><div class="exp-title">Competitive Intel</div><div class="exp-text">'+c.competitive+'</div></div>' : '')
+      + (c.objections ? '<div class="exp-section"><div class="exp-title">Objections</div><div class="exp-text">'+c.objections+'</div></div>' : '')
+      + '<div class="exp-grid">'
+      + (c.topStrength ? '<div class="exp-item"><div class="cf-label">Top Strength</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.topStrength+'</div></div>' : '')
+      + (c.areaImprovement ? '<div class="exp-item"><div class="cf-label">Improve</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.areaImprovement+'</div></div>' : '')
+      + (c.brandPerception ? '<div class="exp-item"><div class="cf-label">Brand Perception</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.brandPerception+'</div></div>' : '')
+      + (c.futureNeeds ? '<div class="exp-item"><div class="cf-label">Future Needs</div><div class="cf-val" style="font-size:11px;line-height:1.5;white-space:normal">'+c.futureNeeds+'</div></div>' : '')
+      + '<div class="exp-item"><div class="cf-label">Agent ID</div><div class="cf-val">'+(c.agentId||'—')+'</div></div>'
+      + (c.homeType ? '<div class="exp-item"><div class="cf-label">Home Type</div><div class="cf-val">'+c.homeType+'</div></div>' : '')
+      + '</div>';
 
-  return '<div class="call-card" style="' + delay + '" onclick="toggleCard(this)">' +
-    '<div class="card-top">' +
-      '<div class="avatar ' + (isCsr ? 'csr' : '') + '">' + initials + '</div>' +
-      '<div class="card-agent">' +
-        '<div class="agent-name">' + c.agentName + '</div>' +
-        '<div class="agent-meta">' + dateStr + ' · ' + c.callType + '</div>' +
-      '</div>' +
-      '<div class="badges">' +
-        '<span class="src-badge ' + (isCsr ? 'src-csr' : 'src-zito') + '">' + (isCsr ? 'CSR' : 'Sales') + '</span>' +
-        '<span class="out-badge ' + outCls + '">' + c.callOutcome + '</span>' +
-      '</div>' +
-    '</div>' +
-    '<div class="card-body">' +
-      '<div class="card-row">' +
-        '<div class="card-field"><span class="cf-label">Area</span><span class="cf-val">' + c.serviceArea + '</span></div>' +
-        '<div class="card-field"><span class="cf-label">Duration</span><span class="cf-val">' + c.duration + '</span></div>' +
-        '<div class="card-field"><span class="cf-label">Score</span><span class="cf-val">' + (c.overallScore || qaLabel) + '</span></div>' +
-      '</div>' +
-      '<div class="qa-row">' +
-        '<span class="qa-lbl">QA</span>' +
-        '<div class="qa-track"><div class="qa-fill" style="width:' + qaWidth + ';background:' + qaColor + '"></div></div>' +
-        '<span class="qa-pct" style="color:' + qaColor + '">' + qaLabel + '</span>' +
-      '</div>' +
-      (c.summary ? '<div class="card-summary">' + c.summary + '</div>' : '') +
-      painHtml +
-      (sentHtml ? '<div class="sentiment">' + sentHtml + '</div>' : '') +
-    '</div>' +
-    '<div class="card-expand">' + expandHtml + '</div>' +
-    '<div class="card-foot">' +
-      '<span class="foot-file">' + c._fileName + '</span>' +
-      '<span class="foot-toggle">Details <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 4l4 4 4-4"/></svg></span>' +
-    '</div>' +
-  '</div>';
+  return '<div class="call-card" style="'+delay+'" onclick="toggleCard(this)">'
+    +'<div class="card-top">'
+      +'<div class="avatar '+(isCsr?'csr':'')+'">'+initials+'</div>'
+      +'<div class="card-agent"><div class="agent-name">'+c.agentName+'</div>'
+        +'<div class="agent-meta">'+dateStr+' · '+c.callType+'</div></div>'
+      +'<div class="badges">'
+        +'<span class="src-badge '+(isCsr?'src-csr':'src-zito')+'">'+(isCsr?'CSR':'Sales')+'</span>'
+        +'<span class="out-badge '+outCls+'">'+c.callOutcome+'</span>'
+      +'</div>'
+    +'</div>'
+    +'<div class="card-body">'
+      +'<div class="card-row">'
+        +'<div class="card-field"><span class="cf-label">Area</span><span class="cf-val">'+c.serviceArea+'</span></div>'
+        +'<div class="card-field"><span class="cf-label">Duration</span><span class="cf-val">'+c.duration+'</span></div>'
+        +'<div class="card-field"><span class="cf-label">Score</span><span class="cf-val">'+(c.overallScore||qaLabel)+'</span></div>'
+      +'</div>'
+      +'<div class="qa-row">'
+        +'<span class="qa-lbl">QA</span>'
+        +'<div class="qa-track"><div class="qa-fill" style="width:'+qaWidth+';background:'+qaColor+'"></div></div>'
+        +'<span class="qa-pct" style="color:'+qaColor+'">'+qaLabel+'</span>'
+      +'</div>'
+      +(c.summary ? '<div class="card-summary">'+c.summary+'</div>' : '')
+      +painHtml
+      +(sentHtml ? '<div class="sentiment">'+sentHtml+'</div>' : '')
+    +'</div>'
+    +'<div class="card-expand">'+expandHtml+'</div>'
+    +'<div class="card-foot">'
+      +'<span class="foot-file">'+c._fileName+'</span>'
+      +'<span class="foot-toggle">Details <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 4l4 4 4-4"/></svg></span>'
+    +'</div>'
+  +'</div>';
 }
 
 function toggleCard(el) { el.classList.toggle('expanded'); }
 
 // ── View Toggle ───────────────────────────────────────────────
 function setView(mode) {
-  document.getElementById('callGrid').classList.toggle('list-view', mode === 'list');
-  document.getElementById('vbtn-grid').classList.toggle('active', mode === 'grid');
-  document.getElementById('vbtn-list').classList.toggle('active', mode === 'list');
+  document.getElementById('callGrid').classList.toggle('list-view', mode==='list');
+  document.getElementById('vbtn-grid').classList.toggle('active', mode==='grid');
+  document.getElementById('vbtn-list').classList.toggle('active', mode==='list');
 }
 
 // ── AI Panel ──────────────────────────────────────────────────
-function getApiKey() {
-  return (document.getElementById('aiApiKey') && document.getElementById('aiApiKey').value || '').trim();
-}
+function getApiKey() { return (document.getElementById('aiApiKey')?.value||'').trim(); }
 
 function onApiKeyInput() {
-  const key = getApiKey();
-  if (key) sessionStorage.setItem('zito_api_key', key);
-  document.getElementById('btnAnalyze').disabled = !(selectedArea && key);
+  const k = getApiKey();
+  if (k) sessionStorage.setItem('zito_api_key', k);
+  document.getElementById('btnAnalyze').disabled = !(selectedArea && k);
 }
 
 function openAiPanel(area) {
@@ -475,31 +583,30 @@ function openAiPanel(area) {
   document.getElementById('aiAreaBadge').textContent = area;
   document.getElementById('btnAnalyze').disabled = !getApiKey();
 
-  const areaCalls = allCalls.filter(c => normalizeArea(c.serviceArea) === normalizeArea(area));
-  const scores    = areaCalls.map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
-  const avgQA     = scores.length ? (scores.reduce((a,b) => a+b, 0) / scores.length).toFixed(1) + '%' : 'N/A';
-  const sales     = areaCalls.filter(c => c.saleCompleted || (c.callOutcome||'').toLowerCase().includes('sale')).length;
-  const support   = areaCalls.filter(c => ['support','dispatch','technical'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
+  const ac     = allCalls.filter(c => normalizeArea(c.serviceArea)===normalizeArea(area));
+  const scores = ac.map(c=>c.qaScore).filter(n=>n!==null&&!isNaN(n));
+  const avgQA  = scores.length ? (scores.reduce((a,b)=>a+b,0)/scores.length).toFixed(1)+'%' : 'N/A';
+  const sales  = ac.filter(c=>classifyOutcome(c)==='sale').length;
+  const supp   = ac.filter(c=>classifyOutcome(c)==='support').length;
 
   document.getElementById('aiBody').innerHTML =
-    '<div class="ai-context">' +
-      '<div class="ai-ctx-row"><span class="ai-ctx-label">Calls in area</span><span class="ai-ctx-val sc">' + areaCalls.length + '</span></div>' +
-      '<div class="ai-ctx-row"><span class="ai-ctx-label">Avg QA Score</span><span class="ai-ctx-val sa">' + avgQA + '</span></div>' +
-      '<div class="ai-ctx-row"><span class="ai-ctx-label">Sales</span><span class="ai-ctx-val sg">' + sales + '</span></div>' +
-      '<div class="ai-ctx-row"><span class="ai-ctx-label">Support calls</span><span class="ai-ctx-val sp">' + support + '</span></div>' +
-    '</div>' +
-    '<div class="ai-placeholder">' +
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2a10 10 0 110 20A10 10 0 0112 2z"/><path d="M8 12h8M12 8l4 4-4 4"/></svg>' +
-      '<p>Click <strong>Generate AI Analysis</strong><br>for next steps on<br><strong>' + area + '</strong>.</p>' +
-    '</div>';
+    '<div class="ai-context">'
+    +'<div class="ai-ctx-row"><span class="ai-ctx-label">Calls in area</span><span class="ai-ctx-val sc">'+ac.length+'</span></div>'
+    +'<div class="ai-ctx-row"><span class="ai-ctx-label">Avg QA Score</span><span class="ai-ctx-val sa">'+avgQA+'</span></div>'
+    +'<div class="ai-ctx-row"><span class="ai-ctx-label">Sales</span><span class="ai-ctx-val sg">'+sales+'</span></div>'
+    +'<div class="ai-ctx-row"><span class="ai-ctx-label">Support calls</span><span class="ai-ctx-val sp">'+supp+'</span></div>'
+    +'</div>'
+    +'<div class="ai-placeholder">'
+    +'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2a10 10 0 110 20A10 10 0 0112 2z"/><path d="M8 12h8M12 8l4 4-4 4"/></svg>'
+    +'<p>Click <strong>Generate AI Analysis</strong><br>for next steps on<br><strong>'+area+'</strong>.</p>'
+    +'</div>';
 }
 
 function closeAiPanel() {
   document.getElementById('aiPanel').classList.remove('open');
   document.getElementById('aiAreaBadge').textContent = '—';
   document.getElementById('btnAnalyze').disabled = true;
-  selectedArea = null;
-  buildAreaList();
+  selectedArea = null; buildAreaList();
 }
 
 async function runAnalysis() {
@@ -509,72 +616,67 @@ async function runAnalysis() {
     return;
   }
   const btn = document.getElementById('btnAnalyze');
-  btn.disabled = true;
-  btn.textContent = 'Analyzing...';
+  btn.disabled = true; btn.textContent = 'Analyzing…';
 
-  const areaCalls   = allCalls.filter(c => normalizeArea(c.serviceArea) === normalizeArea(selectedArea));
-  const scores      = areaCalls.map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
-  const avgQA       = scores.length ? (scores.reduce((a,b) => a+b, 0) / scores.length).toFixed(1) : 'N/A';
-  const sales       = areaCalls.filter(c => c.saleCompleted || (c.callOutcome||'').toLowerCase().includes('sale')).length;
-  const lost        = areaCalls.filter(c => ['lost','cancel'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
-  const support     = areaCalls.filter(c => ['support','dispatch','technical'].some(k => (c.callOutcome||'').toLowerCase().includes(k))).length;
-  const painPoints  = [...new Set(areaCalls.flatMap(c => c.painPoints || []))];
-  const objections  = areaCalls.map(c => c.objections).filter(Boolean).slice(0, 5).join(' | ');
-  const competitive = areaCalls.map(c => c.competitive).filter(Boolean).slice(0, 3).join(' | ');
-  const sentiments  = [...new Set(areaCalls.map(c => c.sentiment).filter(Boolean))].slice(0, 5);
-  const agents      = [...new Set(areaCalls.map(c => c.agentName))];
-  const agentScores = agents.map(a => {
-    const s = areaCalls.filter(c => c.agentName === a).map(c => c.qaScore).filter(n => n !== null && !isNaN(n));
-    return s.length ? a + ': ' + (s.reduce((x,y) => x+y, 0) / s.length).toFixed(1) + '%' : null;
+  const ac          = allCalls.filter(c=>normalizeArea(c.serviceArea)===normalizeArea(selectedArea));
+  const scores      = ac.map(c=>c.qaScore).filter(n=>n!==null&&!isNaN(n));
+  const avgQA       = scores.length ? (scores.reduce((a,b)=>a+b,0)/scores.length).toFixed(1) : 'N/A';
+  const sales       = ac.filter(c=>classifyOutcome(c)==='sale').length;
+  const lost        = ac.filter(c=>classifyOutcome(c)==='lost').length;
+  const support     = ac.filter(c=>classifyOutcome(c)==='support').length;
+  const painPoints  = [...new Set(ac.flatMap(c=>c.painPoints||[]))];
+  const objections  = ac.map(c=>c.objections).filter(Boolean).slice(0,5).join(' | ');
+  const competitive = ac.map(c=>c.competitive).filter(Boolean).slice(0,3).join(' | ');
+  const sentiments  = [...new Set(ac.map(c=>c.sentiment).filter(Boolean))].slice(0,5);
+  const agents      = [...new Set(ac.map(c=>c.agentName))];
+  const agentScores = agents.map(a=>{
+    const s=ac.filter(c=>c.agentName===a).map(c=>c.qaScore).filter(n=>n!==null&&!isNaN(n));
+    return s.length ? a+': '+(s.reduce((x,y)=>x+y,0)/s.length).toFixed(1)+'%' : null;
   }).filter(Boolean);
+  const topReasons  = ac.map(c=>c.reasonForCalling).filter(r=>r&&r.toLowerCase()!=='n/a').slice(0,5).join(' | ');
 
   const prompt =
-    'You are a telecom sales and customer service operations analyst. Analyze this call data for the service area "' + selectedArea + '" and provide specific, actionable next steps.\n\n' +
-    'SERVICE AREA: ' + selectedArea + '\n' +
-    'TOTAL CALLS: ' + areaCalls.length + '\n' +
-    'AVERAGE QA SCORE: ' + avgQA + '%\n' +
-    'SALES: ' + sales + ' | LOST/CANCELED: ' + lost + ' | SUPPORT/TECHNICAL: ' + support + '\n' +
-    'AGENT QA SCORES: ' + (agentScores.join(', ') || 'N/A') + '\n' +
-    'COMMON PAIN POINTS: ' + (painPoints.join(', ') || 'None identified') + '\n' +
-    'CUSTOMER OBJECTIONS: ' + (objections || 'None noted') + '\n' +
-    'COMPETITIVE INTEL: ' + (competitive || 'None noted') + '\n' +
-    'CUSTOMER SENTIMENTS: ' + (sentiments.join(', ') || 'N/A') + '\n\n' +
-    'Respond in this exact format:\n\n' +
-    '### Sales Performance\n[2-3 bullet points about what\'s working and what needs improvement]\n\n' +
-    '### Key Coaching Actions\n[3-4 specific coaching actions based on objections/scores]\n\n' +
-    '### Competitive Strategy\n[2-3 bullet points on handling competitive threats]\n\n' +
-    '### Customer Experience\n[2-3 bullet points on addressing pain points and improving sentiment]\n\n' +
-    '### Immediate Next Steps\n[3 concrete, prioritized action items numbered 1-3]\n\n' +
-    'Be specific, data-driven, and concise. Reference actual numbers.';
+    'You are a telecom sales and customer service operations analyst.\n\n'+
+    'SERVICE AREA: '+selectedArea+'\nTOTAL CALLS: '+ac.length+
+    '\nAVERAGE QA SCORE: '+avgQA+'%'+
+    '\nSALES: '+sales+' | LOST/CANCELED: '+lost+' | SUPPORT/TECHNICAL: '+support+
+    '\nAGENT QA SCORES: '+(agentScores.join(', ')||'N/A')+
+    '\nCOMMON PAIN POINTS: '+(painPoints.join(', ')||'None')+
+    '\nREASONS FOR CALLING: '+(topReasons||'None noted')+
+    '\nCUSTOMER OBJECTIONS: '+(objections||'None noted')+
+    '\nCOMPETITIVE INTEL: '+(competitive||'None noted')+
+    '\nCUSTOMER SENTIMENTS: '+(sentiments.join(', ')||'N/A')+
+    '\n\nRespond in this exact format:\n\n'+
+    '### Sales Performance\n[2-3 bullet points]\n\n'+
+    '### Key Coaching Actions\n[3-4 specific coaching actions]\n\n'+
+    '### Competitive Strategy\n[2-3 bullet points]\n\n'+
+    '### Customer Experience\n[2-3 bullet points]\n\n'+
+    '### Immediate Next Steps\n[3 prioritized items numbered 1-3]\n\n'+
+    'Be specific, data-driven. Reference actual numbers.';
 
   const body = document.getElementById('aiBody');
-  const ctx  = (body.querySelector('.ai-context') || {outerHTML:''}).outerHTML;
-  body.innerHTML = ctx + '<div class="ai-loading"><div class="spinner"></div> Analyzing ' + areaCalls.length + ' calls in ' + selectedArea + '...</div>';
+  const ctx  = (body.querySelector('.ai-context')||{outerHTML:''}).outerHTML;
+  body.innerHTML = ctx+'<div class="ai-loading"><div class="spinner"></div> Analyzing '+ac.length+' calls in '+selectedArea+'…</div>';
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const res  = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key':    apiKey,
+        'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
         'anthropic-dangerous-direct-browser-access': 'true',
       },
-      body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        messages:   [{ role: 'user', content: prompt }],
-      }),
+      body: JSON.stringify({ model:'claude-sonnet-4-20250514', max_tokens:1000,
+        messages:[{role:'user',content:prompt}] }),
     });
-    const data = await response.json();
-    const text = (data.content && data.content[0] && data.content[0].text) || 'No analysis returned.';
-    body.innerHTML = ctx + '<div class="ai-output">' + markdownToHtml(text) + '</div>';
+    const data = await res.json();
+    const text = data.content?.[0]?.text || 'No analysis returned.';
+    body.innerHTML = ctx+'<div class="ai-output">'+markdownToHtml(text)+'</div>';
   } catch(e) {
-    body.innerHTML = ctx + '<div class="ai-output"><p style="color:var(--red)">Analysis failed: ' + e.message + '</p></div>';
+    body.innerHTML = ctx+'<div class="ai-output"><p style="color:var(--red)">Analysis failed: '+e.message+'</p></div>';
   }
-
-  btn.disabled    = false;
-  btn.textContent = '↺ Re-analyze';
+  btn.disabled = false; btn.textContent = '↺ Re-analyze';
 }
 
 function markdownToHtml(md) {
@@ -583,7 +685,7 @@ function markdownToHtml(md) {
     .replace(/\*\*(.+?)\*\*/g,   '<strong>$1</strong>')
     .replace(/^[-•] (.+)$/gm,    '<li>$1</li>')
     .replace(/^(\d+)\. (.+)$/gm, '<div class="ai-action-item"><strong>$1.</strong> $2</div>')
-    .replace(/(<li>.*<\/li>\n?)+/g, function(m){ return '<ul>' + m + '</ul>'; })
+    .replace(/(<li>.*<\/li>\n?)+/g, m => '<ul>'+m+'</ul>')
     .replace(/\n\n/g, '</p><p>')
     .replace(/^(?!<[hup])(.+)$/gm, '<p>$1</p>')
     .replace(/<p><\/p>/g, '');
@@ -591,11 +693,11 @@ function markdownToHtml(md) {
 
 // ── Helpers ───────────────────────────────────────────────────
 function parseDateFromFileName(name) {
-  const match = (name || '').match(/(\d{10,16})/);
-  if (!match) return null;
-  let ts = parseInt(match[1]);
-  if (ts > 1e15) ts = Math.floor(ts / 1000);
+  const m = (name||'').match(/(\d{10,16})/);
+  if (!m) return null;
+  let ts = parseInt(m[1]);
+  if (ts > 1e15) ts = Math.floor(ts/1000);
   if (ts > 1e12) return new Date(ts);
-  if (ts > 1e9)  return new Date(ts * 1000);
+  if (ts > 1e9)  return new Date(ts*1000);
   return null;
 }
